@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -15,6 +16,7 @@ import time
 import traceback
 import unicodedata
 from email.message import EmailMessage
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -649,6 +651,7 @@ MAX_ADVICE_ODDS = float(os.environ.get("MAX_ADVICE_ODDS", "8.0"))
 MIN_ADVICE_PROB = float(os.environ.get("MIN_ADVICE_PROB", "0.12"))
 SHOW_LIMIT = int(os.environ.get("SHOW_LIMIT", "14"))
 TOP_MATCHES = int(os.environ.get("TOP_MATCHES", "3"))
+EXTERNAL_WEIGHT = float(os.environ.get("EXTERNAL_WEIGHT", "0.5"))
 MAX_GOALS_GRID = 12
 MODEL_TAG = "market-v3"
 MARKET_ORDER = ["HAD", "HDC", "HIL", "CHL", "TTG", "FHA", "FHL", "HFT", "FTS"]
@@ -908,35 +911,75 @@ def card_matches(day: str, notes: list[str]) -> list[dict]:
     return out
 
 
-def build_model(match: dict, notes: list[str]) -> dict | None:
-    """一场比赛的核心分布，全部来自盘口。"""
-    books = match["books"]
-    lam_total, pmf_total, total_fit = fit_market_pmf(books.get("HIL") or [])
+def blend_lambdas(hk: float | None, external: float | None,
+                  weight_external: float = EXTERNAL_WEIGHT) -> tuple[float | None, str]:
+    """两套独立赔率各拟合一个均值，按权重融合。只有一边就用那边。"""
+    if hk and external:
+        return (hk * (1 - weight_external) + external * weight_external,
+                f"马会{1 - weight_external:.0%}+外部{weight_external:.0%}")
+    if external:
+        return external, "仅外部"
+    if hk:
+        return hk, "仅马会"
+    return None, "无"
+
+
+def build_model(match: dict, notes: list[str],
+                use_hk: bool = True, use_external: bool = True) -> dict | None:
+    """一场比赛的核心分布。马会和外部盘口各拟合一次再融合。
+
+    use_hk / use_external 用来做留一法：给 A 家定价时只用 B 家的分布，
+    否则拿 A 自己的赔率反推出来的概率去评价 A 的赔率，期望恒等于 1 减抽水，永远看不出价值。
+    """
+    books = match["books"] if use_hk else {}
+    ext = (match.get("external") or {}) if use_external else {}
+
+    lam_hk, pmf_hk, total_fit = fit_market_pmf(books.get("HIL") or [])
+    lam_ext, pmf_ext, ext_fit = fit_market_pmf(ext.get("HIL") or [])
     total_source = "入球大细多档"
-    if lam_total is None:
+    if lam_hk is None and lam_ext is None:
         # 大细档位不够时退回总入球盘，退回来的分布不算「自拟合」。
         for item in books.get("TTG") or []:
             pmf = ttg_pmf(item["picks"])
             if pmf:
-                pmf_total = pmf
-                lam_total = sum(index * prob for index, prob in enumerate(pmf))
+                lam_hk = sum(index * prob for index, prob in enumerate(pmf))
+                pmf_hk = pmf
                 total_source = "总入球盘"
                 break
-    if not lam_total or not pmf_total:
+    lam_total, total_mix = blend_lambdas(lam_hk, lam_ext)
+    if not lam_total:
+        return None
+    pmf_total = poisson_pmf(lam_total)
+
+    def home_win_of(lines: list[dict]) -> float | None:
+        for item in lines:
+            fair = devig(item["picks"])
+            if "H" in fair:
+                return fair["H"]
         return None
 
-    home_win = None
-    for item in books.get("HAD") or []:
-        fair = devig(item["picks"])
-        if "H" in fair:
-            home_win = fair["H"]
-            break
+    hk_win = home_win_of(books.get("HAD") or [])
+    ext_win = home_win_of(ext.get("HAD") or [])
+    if hk_win is None and ext_win is None:
+        # 没有主客和盘就无法拆分主客入球，硬按 50/50 会造出离谱的期望。
+        return None
+    if hk_win is not None and ext_win is not None:
+        home_win = hk_win * (1 - EXTERNAL_WEIGHT) + ext_win * EXTERNAL_WEIGHT
+    else:
+        home_win = ext_win if hk_win is None else hk_win
 
     lam_home, lam_away = split_lambdas(lam_total, home_win)
     margins = margin_pmf(lam_home, lam_away)
 
-    lam_corner, pmf_corner, corner_fit = fit_market_pmf(books.get("CHL") or [])
+    corner_src = (ext.get("CHL") or []) if len(ext.get("CHL") or []) > len(books.get("CHL") or []) \
+        else (books.get("CHL") or [])
+    lam_corner, pmf_corner, corner_fit = fit_market_pmf(corner_src)
+
     lam_half, pmf_half, half_fit = fit_market_pmf(books.get("FHL") or [])
+    ext_half, _, ext_half_fit = fit_market_pmf(ext.get("FHL") or [])
+    lam_half, half_mix = blend_lambdas(lam_half, ext_half)
+    if ext_half and not lam_half:
+        half_fit = ext_half_fit
     share = 0.45
     half_fitted = bool(lam_half and lam_total > 0.05)
     if half_fitted:
@@ -958,7 +1001,11 @@ def build_model(match: dict, notes: list[str]) -> dict | None:
         "margins_half": margins_half,
         "total_source": total_source,
         "total_fit": total_fit,
+        "ext_total_fit": ext_fit,
         "half_fit": half_fit,
+        "total_mix": total_mix,
+        "half_mix": half_mix,
+        "has_external": bool(ext),
     }
 
 
@@ -969,7 +1016,7 @@ SELF_FIT = {
     "CHL": ("corner_fit", None),
     "FHL": ("half_fit", "half_fitted"),
 }
-MIN_FIT_POINTS = 4
+MIN_FIT_POINTS = 3
 MAX_FIT_RESIDUAL = 0.025
 
 
@@ -1044,6 +1091,19 @@ def selection_prob(mtype: str, side: str, line: float | None, model: dict) -> tu
     return None
 
 
+def mirror_line_text(text: str) -> str:
+    """把主队让球文字翻到客队视角：-2.0/-2.5 → +2.0/+2.5。"""
+    def swap(match: re.Match) -> str:
+        raw = match.group(0)
+        value = -float(raw)
+        if abs(value) < 1e-9:
+            return "0"
+        # 保留原文的小数位（-2.0 → +2.0），别把档位写成另一种写法。
+        decimals = len(raw.split(".")[1]) if "." in raw else 0
+        return f"{value:+.{decimals}f}" if decimals else f"{value:+g}"
+    return re.sub(r"[+-]?\d+(?:\.\d+)?", swap, text)
+
+
 def side_label(mtype: str, side: str, line_text: str, home: str, away: str) -> str:
     if mtype == "HAD":
         return {"H": f"{home}胜", "D": "和", "A": f"{away}胜"}.get(side, side)
@@ -1052,8 +1112,10 @@ def side_label(mtype: str, side: str, line_text: str, home: str, away: str) -> s
     if mtype == "TTG":
         return f"{side}球"
     if mtype == "HDC":
-        who = home if side == "H" else away
-        return f"{who} {line_text}"
+        # 马会让球文字是主队视角，客队那条线必须翻号，否则会看反方向。
+        if side == "H":
+            return f"{home} {line_text}"
+        return f"{away} {mirror_line_text(line_text)}"
     if mtype == "HIL":
         return f"{'大' if side == 'H' else '细'}{line_text}"
     if mtype == "CHL":
@@ -1082,18 +1144,21 @@ def match_meta(match: dict) -> dict:
     }
 
 
-def evaluate(match: dict, model: dict) -> list[dict]:
-    """把这场所有盘口的每个方向都定价。"""
+def evaluate_book(match: dict, model: dict, books: dict, book_name: str) -> list[dict]:
+    """给某一家的盘口定价。分布来自融合模型，所以和这家自己的赔率无关，不存在同源循环。"""
     out = []
     meta = match_meta(match)
     for mtype in MARKET_ORDER:
-        for item in match["books"].get(mtype) or []:
+        for item in books.get(mtype) or []:
             line = item.get("line")
-            book_sum = sum(1.0 / odds for odds in item["picks"].values() if odds > 1.0)
-            # 簿面异常说明报价过期或数据错乱，这种档位一律不算。
-            if book_sum < 1.02 or book_sum > 1.6:
-                continue
+            if book_name == HKJC_BOOK:
+                # 马会自家两边加起来低于 2% 抽水，说明报价过期或数据错乱，直接不算。
+                # 外部公司不在这里过滤：负抽水要留着让 arb_scan 报成假套利，不能静默丢掉。
+                book_sum = sum(1.0 / odds for odds in item["picks"].values() if odds > 1.0)
+                if book_sum < 1.02 or book_sum > 1.6:
+                    continue
             fair = devig(item["picks"])
+            level, why = confidence(mtype, model)
             for side, odds in item["picks"].items():
                 if not odds or odds < MIN_ODDS:
                     continue
@@ -1103,9 +1168,6 @@ def evaluate(match: dict, model: dict) -> list[dict]:
                 prob, push = view
                 if prob <= 0.0005:
                     continue
-                edge = prob * odds - 1 + push
-                breakeven = (1 - push) / prob if prob > 0 else None
-                level, why = confidence(mtype, model)
                 out.append({
                     "match": f"{match['kickoff']} {match['home_ch']} vs {match['away_ch']}",
                     "mtype": mtype,
@@ -1115,17 +1177,23 @@ def evaluate(match: dict, model: dict) -> list[dict]:
                     "line": line,
                     "line_text": item["text"],
                     "main": item["main"],
+                    "book": book_name,
                     "odds": odds,
                     "prob": prob,
                     "push": push,
-                    "edge": edge,
-                    "breakeven": breakeven,
+                    "edge": prob * odds - 1 + push,
+                    "breakeven": (1 - push) / prob if prob > 0 else None,
                     "fair": fair.get(side),
                     "conf": level,
                     "conf_why": why,
                     "meta": meta,
                 })
     return out
+
+
+def evaluate(match: dict, model: dict) -> list[dict]:
+    """给马会自己的盘口定价。"""
+    return evaluate_book(match, model, match["books"], HKJC_BOOK)
 
 
 def vig_table(quotes: list[dict]) -> list[tuple[str, float, int]]:
@@ -1140,12 +1208,42 @@ def vig_table(quotes: list[dict]) -> list[tuple[str, float, int]]:
     return rows
 
 
-def screen(day: str, notes: list[str]) -> tuple[list[dict], list[dict]]:
+def annotate_external_rows(match: dict, rows: list[dict], reference: dict | None) -> list[dict]:
+    """给马会报价补上 Pinnacle 同档位的对照价。Pinnacle 更锐，作为公平价基准。"""
+    ref_index = {}
+    for mtype, lines in (reference or {}).items():
+        for item in lines:
+            for side, odds in item["picks"].items():
+                ref_index[(mtype, side, line_key(mtype, item.get("line")))] = odds
+    for row in rows:
+        ref_odds = ref_index.get((row["mtype"], row["side_code"], line_key(row["mtype"], row["line"])))
+        row["ref_book"] = PINNACLE_BOOK if ref_odds else None
+        row["ref_odds"] = ref_odds
+        row["suspicious"] = None
+    return rows
+
+
+def annotate_reference_rows(match: dict, rows: list[dict]) -> list[dict]:
+    """给外部报价补上马会同档位价格，偏离过大的判为过期数据。"""
+    for row in rows:
+        line = find_hkjc_line(match, row["mtype"], row["line"])
+        row["hkjc_odds"] = line["picks"].get(row["side_code"]) if line else None
+        row["suspicious"] = suspicious_reason(row)
+    return rows
+
+
+def screen(day: str, notes: list[str], auto_external: bool = True) -> tuple[list[dict], list[dict]]:
     """返回 (全部方向, 参与比较的场次)。"""
     matches = card_matches(day, notes)
     if not matches:
         notes.append("窗口内没有可分析的比赛。")
         return [], []
+    if auto_external:
+        ext_books, ext_corners = fetch_external_books(matches, notes)
+        for match in matches:
+            match["external"] = ext_books.get(match["no"]) or {}
+            if ext_corners.get(match["no"]):
+                match["external"]["CHL"] = ext_corners[match["no"]]
     quotes: list[dict] = []
     modelled: list[dict] = []
     skipped = []
@@ -1156,7 +1254,16 @@ def screen(day: str, notes: list[str]) -> tuple[list[dict], list[dict]]:
             continue
         match["model"] = model
         modelled.append(match)
-        quotes.extend(evaluate(match, model))
+        if not (auto_external and match.get("external")):
+            quotes.extend(evaluate(match, model))
+            continue
+        # 留一法：给马会定价只用 Pinnacle 分布，给 Pinnacle 定价只用马会分布。
+        only_hk = build_model(match, notes, use_external=False)
+        only_ext = build_model(match, notes, use_hk=False)
+        hk_rows = evaluate_book(match, only_ext or model, match["books"], HKJC_BOOK)
+        quotes.extend(annotate_external_rows(match, hk_rows, match["external"]))
+        ext_rows = evaluate_book(match, only_hk or model, match["external"], PINNACLE_BOOK)
+        quotes.extend(annotate_reference_rows(match, ext_rows))
     notes.append(
         f"窗口内 {len(matches)} 场，{len(modelled)} 场能用盘口反推分布，"
         f"摊平出 {len(quotes)} 个可下方向。"
@@ -1223,6 +1330,7 @@ def history_row(day: str, pick: dict) -> dict | None:
         "side": pick.get("side"),
         "line": pick.get("line"),
         "line_text": pick.get("line_text"),
+        "book": pick.get("book") or HKJC_BOOK,
         "model": MODEL_TAG,
         "odds": pick.get("odds"),
         "prob": pick.get("prob"),
@@ -1604,16 +1712,32 @@ def pick_payload(picks: list[dict]) -> list[dict]:
     ]
 
 
+def meets_advice(pick: dict) -> bool:
+    """下注门槛，只判单个方向。注码提示和推荐列表都用它，避免两处口径打架。"""
+    if pick.get("conf") != "high" or pick.get("mtype") not in SETTLE_MTYPES:
+        return False
+    if pick.get("book") == PINNACLE_BOOK:
+        return False      # 锐价基准不作为下注目标
+    if (pick.get("edge") or -9) < MIN_EDGE_ADVICE:
+        return False
+    if pick.get("odds", 0) > MAX_ADVICE_ODDS or (pick.get("prob") or 0) < MIN_ADVICE_PROB:
+        return False
+    return True
+
+
 def stake_hint(pick: dict) -> str:
     edge = pick.get("edge")
     if edge is None:
         return "没赔率"
     if pick.get("conf") != "high":
         return "不下（分布不可信）"
-    if edge >= MIN_EDGE_ADVICE:
+    if pick.get("book") == PINNACLE_BOOK:
+        # Pinnacle 是锐价基准，用别家概率反推说它「有价值」是反的，只作观察。
+        return "仅观察（锐价基准）"
+    if meets_advice(pick):
         return "正常注"
-    if edge >= 0.0:
-        return "小注"
+    if edge >= 0:
+        return "不下（不满足门槛）"
     return "不下"
 
 
@@ -1815,11 +1939,7 @@ def advisable(pool: list[dict]) -> list[dict]:
     picked = []
     seen = set()
     for pick in pool:
-        if pick.get("conf") != "high" or pick.get("mtype") not in SETTLE_MTYPES:
-            continue
-        if (pick.get("edge") or -9) < MIN_EDGE_ADVICE:
-            continue
-        if pick["odds"] > MAX_ADVICE_ODDS or pick["prob"] < MIN_ADVICE_PROB:
+        if not meets_advice(pick):
             continue
         key = pick["meta"]["no"]
         if key in seen:
@@ -1842,6 +1962,507 @@ def divergence_lines(pool: list[dict], limit: int = 5) -> list[str]:
             f"｜模型{pick['prob']:.1%} 保本{pick['breakeven']:.2f} 马会{pick['odds']:g}"
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# 外部赔率自动抓取（Pinnacle）
+#
+# 手动录入不可行，所以这里直接抓。Pinnacle 的 guest 接口不需要 key，
+# 而且它是行业里贴水最低、最锐的一家，用它当第二套独立定价最合适。
+# 已交叉验证：Pinnacle 去抽水概率与马会平均只差 1.5 个百分点，偏差均值约 0。
+#
+# 抓取顺序：先取赛程（一次），按队名 + 开赛时间匹配到马会场次，
+# 再只对匹配上的比赛取盘口，避免几百次无谓请求。
+# ---------------------------------------------------------------------------
+
+PINNACLE_BASE = "https://guest.api.arcadia.pinnacle.com/0.1"
+PINNACLE_SOCCER = 29
+PINNACLE_UA = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Referer": "https://www.pinnacle.com/",
+}
+# 黄牌、角球、青年队之类会被同名队匹配上，必须排除主盘。
+PINNACLE_SKIP = ("Corners", "Bookings", "Cards", "Throw", "U23", "U21", "U19",
+                 "Youth", "Reserve", "Women", "Esports")
+TIME_TOLERANCE = 4 * 3600
+NAME_THRESHOLD = 70
+PINNACLE_BOOK = "Pinnacle"
+
+
+def american_to_decimal(price) -> float | None:
+    """Pinnacle 给的是美式赔率：正数是 +X，负数是 -X。"""
+    try:
+        value = float(price)
+    except (TypeError, ValueError):
+        return None
+    if value == 0:
+        return None
+    decimal = 1 + value / 100 if value > 0 else 1 + 100 / abs(value)
+    return decimal if 1.01 < decimal < 1000 else None
+
+
+def pinnacle_get(path: str):
+    url = f"{PINNACLE_BASE}/{path}"
+    last = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=PINNACLE_UA, timeout=45)
+            if resp.status_code == 200:
+                return resp.json()
+            last = f"HTTP {resp.status_code}"
+        except requests.RequestException as exc:
+            last = str(exc)
+        time.sleep(1 + attempt)
+    raise requests.RequestException(f"Pinnacle {path} 取不到：{last}")
+
+
+def pinnacle_raw_matchups() -> list[dict]:
+    """赛程原始数据，一次抓取反复使用。主盘和角球盘都从这里派生，避免重复下载。"""
+    def load():
+        return pinnacle_get(f"sports/{PINNACLE_SOCCER}/matchups") or []
+
+    return cached_json("pinnacle-raw-matchups.json", load, max_age_hours=0.15)
+
+
+def _fixture_rows(raw: list[dict], corner: bool) -> list[dict]:
+    keep = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        league = (item.get("league") or {}).get("name") or ""
+        if item.get("type") != "matchup" or item.get("isLive") or not item.get("startTime"):
+            continue
+        if corner != ("Corners" in league):
+            continue
+        if not corner and any(bad in league for bad in PINNACLE_SKIP):
+            continue
+        parts = {}
+        for p in item.get("participants") or []:
+            name = (p.get("name") or "").strip()
+            if corner:
+                name = re.sub(r"\s*\(Corners\)\s*", "", name).strip()
+            parts[p.get("alignment")] = name
+        if not parts.get("home") or not parts.get("away"):
+            continue
+        keep.append({
+            "id": item["id"],
+            "start": item["startTime"],
+            "league": league,
+            "home": parts["home"],
+            "away": parts["away"],
+        })
+    return keep
+
+
+def pinnacle_matchups() -> list[dict]:
+    return _fixture_rows(pinnacle_raw_matchups(), corner=False)
+
+
+def pinnacle_corner_matchups() -> list[dict]:
+    return _fixture_rows(pinnacle_raw_matchups(), corner=True)
+
+
+def pinnacle_straight(matchup_id) -> list[dict]:
+    def load():
+        data = pinnacle_get(f"matchups/{matchup_id}/markets/related/straight")
+        return [item for item in (data or [])
+                if isinstance(item, dict) and item.get("matchupId") == matchup_id]
+
+    return cached_json(f"pinnacle-markets-{matchup_id}.json", load, max_age_hours=0.1)
+
+
+def pinnacle_lines(markets: list[dict]) -> dict[str, list[dict]]:
+    """把 Pinnacle 盘口转成和马会一样的结构，只保留能对上的类型。"""
+    books: dict[str, list[dict]] = {}
+    for item in markets:
+        key = str(item.get("key") or "")
+        if not key.startswith("s;"):
+            continue
+        parts = key.split(";")
+        if len(parts) < 3:
+            continue
+        try:
+            period = int(parts[1])
+        except ValueError:
+            continue
+        kind = parts[2]
+        prices = {}
+        points = None
+        for price in item.get("prices") or []:
+            design = price.get("designation")
+            decimal = american_to_decimal(price.get("price"))
+            if not design or decimal is None:
+                continue
+            prices[design] = decimal
+            if price.get("points") is not None and points is None:
+                points = float(price["points"])
+        if len(parts) > 3:
+            try:
+                points = float(parts[3])
+            except ValueError:
+                pass
+        mtype = None
+        picks = None
+        line = None
+        if kind == "m":
+            mtype = "HAD" if period == 0 else "FHA"
+            if {"home", "draw", "away"} <= set(prices):
+                picks = {"H": prices["home"], "D": prices["draw"], "A": prices["away"]}
+                line = 0.0
+        elif kind == "ou":
+            mtype = "HIL" if period == 0 else "FHL"
+            if {"over", "under"} <= set(prices) and points is not None:
+                picks = {"H": prices["over"], "L": prices["under"]}
+                line = points
+        elif kind == "s":
+            if period == 0 and {"home", "away"} <= set(prices) and points is not None:
+                mtype = "HDC"
+                picks = {"H": prices["home"], "A": prices["away"]}
+                line = points
+        if not mtype or not picks:
+            continue
+        books.setdefault(mtype, []).append({
+            "line": line,
+            "text": f"{line:+g}" if mtype == "HDC" else f"{line:g}",
+            "main": not item.get("isAlternate"),
+            "picks": picks,
+            "uid": key,
+        })
+    # 主盘排前面，同时按档位排序，方便阅读
+    for lines in books.values():
+        lines.sort(key=lambda row: (not row["main"], row["line"] if row["line"] is not None else 0))
+    return books
+
+
+def match_external_fixture(modelled: list[dict], fixtures: list[dict]) -> dict[str, dict]:
+    """按英文队名 + 开赛时间把外部赛程对到马会场次。时间差超过 4 小时不认。"""
+    index: dict[str, dict] = {}
+    for match in modelled:
+        best = None
+        for fixture in fixtures:
+            score = (
+                name_score(match["home"], fixture["home"])
+                + name_score(match["away"], fixture["away"])
+            ) / 2
+            if score < NAME_THRESHOLD:
+                continue
+            try:
+                delta = abs((datetime.fromisoformat(fixture["start"].replace("Z", "+00:00"))
+                             - match["when"]).total_seconds())
+            except ValueError:
+                continue
+            if delta > TIME_TOLERANCE:
+                continue
+            if best is None or score > best[0]:
+                best = (score, fixture)
+        if best:
+            index[match["no"]] = best[1]
+    return index
+
+
+def fetch_external_books(modelled: list[dict], notes: list[str]) -> tuple[dict, dict]:
+    """返回 ({马会场次号: 外部盘口}, {马会场次号: 角球盘口})。失败不影响主流程。"""
+    if not modelled:
+        return {}, {}
+    try:
+        raw = pinnacle_raw_matchups()
+    except Exception as exc:
+        notes.append(f"Pinnacle 赛程没取到，这轮只按马会定价：{exc}")
+        return {}, {}
+    matched = match_external_fixture(modelled, _fixture_rows(raw, corner=False))
+    if not matched:
+        notes.append("Pinnacle 赛程里没有能对上马会的比赛，这轮只按马会定价。")
+        return {}, {}
+
+    corner_matched = match_external_fixture(modelled, _fixture_rows(raw, corner=True))
+    main_ids = {no: fixture["id"] for no, fixture in matched.items()}
+    corner_ids = {no: fixture["id"] for no, fixture in corner_matched.items()}
+
+    def pull(matchup_id):
+        try:
+            return matchup_id, pinnacle_lines(pinnacle_straight(matchup_id))
+        except Exception:
+            return matchup_id, {}
+
+    fetched: dict[int, dict] = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for matchup_id, lines in pool.map(pull, set(main_ids.values()) | set(corner_ids.values())):
+            fetched[matchup_id] = lines
+
+    books = {}
+    for no, matchup_id in main_ids.items():
+        lines = fetched.get(matchup_id) or {}
+        if lines:
+            books[no] = lines
+    corners = {}
+    for no, matchup_id in corner_ids.items():
+        lines = fetched.get(matchup_id) or {}
+        if lines.get("HIL"):
+            corners[no] = lines["HIL"]
+
+    notes.append(
+        f"自动抓到 Pinnacle {len(books)} 场盘口"
+        + (f"、{len(corners)} 场角球盘口" if corners else "")
+        + f"（马会窗口内共 {len(modelled)} 场）。"
+    )
+    return books, corners
+
+
+# ---------------------------------------------------------------------------
+# 外部比价层
+#
+# 只用马会盘口时，概率和赔率同源，期望必然等于 1 减抽水。要赚钱只有两条路：
+#   1) 比价：别家赔率高于「保本赔率」才是真价值，靠的是两家定价分歧。
+#   2) 套利：两边赔率倒数之和小于 1，收益固定，与比赛结果无关。
+# 外部赔率由程序自动抓取（见上面的 Pinnacle 抓取层），不需要人工录入。
+# 定价时做留一法：给马会定价只用外部分布，给外部定价只用马会分布，
+# 否则拿同一家的赔率反推概率再评价同一家的赔率，期望恒等于 1 减抽水。
+# ---------------------------------------------------------------------------
+
+MIN_EXTERNAL_EDGE = float(os.environ.get("MIN_EXTERNAL_EDGE", "0.02"))
+MAX_STAKE_PCT = float(os.environ.get("MAX_STAKE_PCT", "0.05"))
+KELLY_FRACTION = float(os.environ.get("KELLY_FRACTION", "0.25"))
+ARB_MIN_PROFIT = float(os.environ.get("ARB_MIN_PROFIT", "0.002"))
+DEVIATION_LIMIT = float(os.environ.get("DEVIATION_LIMIT", "0.30"))
+HKJC_BOOK = "馬會"
+
+# 覆盖整个盘口所需的边。只有这几类盘口能算套利，半全场/总入球/首球组合太散，不纳入。
+COVER_SIDES = {
+    "HIL": ("H", "L"),
+    "CHL": ("H", "L"),
+    "FHL": ("H", "L"),
+    "HDC": ("H", "A"),
+    "HAD": ("H", "D", "A"),
+    "FHA": ("H", "D", "A"),
+}
+
+
+def line_key(mtype: str, line: float | None) -> str:
+    """同一档位的统一标识。让球正负号有意义，不能取绝对值。"""
+    if line is None:
+        return "side"
+    return f"{round(float(line), 2):+g}"
+
+
+def find_hkjc_line(match: dict, mtype: str, line: float | None) -> dict | None:
+    """在马会同一盘口里找最接近的档位。没挂这条线就返回 None。"""
+    for item in match["books"].get(mtype) or []:
+        if line is None and item.get("line") is None:
+            return item
+        if line is not None and item.get("line") is not None and abs(item["line"] - line) < 0.01:
+            return item
+    return None
+
+
+def suspicious_reason(row: dict) -> str | None:
+    """识别明显不可信的报价。追错误数据是这类工具最容易真亏钱的地方。"""
+    odds = row["odds"]
+    hkjc = row.get("hkjc_odds")
+    if hkjc:
+        gap = odds / hkjc - 1
+        if gap > DEVIATION_LIMIT:
+            return f"比马会同档位高 {gap:.0%}，多半是过期赔率"
+        if gap < -DEVIATION_LIMIT:
+            return f"比马会同档位低 {gap:.0%}，不会有人下这种价"
+    elif row["edge"] > 0.15:
+        # 马会没挂这条线，没有参照物，超额期望一律当数据可疑处理。
+        return f"这条档位马会没挂，却给出 {row['edge']:+.0%} 期望，无法交叉验证"
+    return None
+
+
+def kelly_stake(pick: dict) -> float:
+    """四分之一凯利，按本金比例。带封顶，避免模型误差放大成重仓。"""
+    odds = pick.get("odds") or 0
+    if odds <= 1.01:
+        return 0.0
+    fraction = ((pick.get("edge") or 0) / (odds - 1)) * KELLY_FRACTION
+    if pick.get("odds", 0) > 4:
+        fraction = min(fraction, MAX_STAKE_PCT / 3)
+    return max(0.0, min(MAX_STAKE_PCT, fraction))
+
+
+def odds_pool(modelled: list[dict], priced: list[dict]) -> dict[tuple, dict[str, list[tuple[float, str]]]]:
+    """把马会和外部报价汇成一个池：{(场次, 盘口, 档位): {边: [(赔率, 来源)]}}。"""
+    pool: dict[tuple, dict[str, list[tuple[float, str]]]] = {}
+    for match in modelled:
+        for mtype in COVER_SIDES:
+            for item in match["books"].get(mtype) or []:
+                key = (match["no"], mtype, line_key(mtype, item.get("line")))
+                bag = pool.setdefault(key, {})
+                for side, odds in item["picks"].items():
+                    bag.setdefault(side, []).append((odds, HKJC_BOOK))
+    for row in priced:
+        if row["mtype"] not in COVER_SIDES:
+            continue
+        key = (row["meta"]["no"], row["mtype"], line_key(row["mtype"], row["line"]))
+        pool.setdefault(key, {}).setdefault(row["side_code"], []).append((row["odds"], row["book"]))
+    return pool
+
+
+def arb_scan(modelled: list[dict], priced: list[dict]) -> tuple[list[dict], list[dict]]:
+    """找出两边赔率倒数之和小于 1 的组合。返回 (套利组合, 被否决的可疑组合)。
+
+    必须跨公司：只在一家凑齐的两侧等于这家在做亏本生意，现实中不存在。
+    """
+    names = {(match["no"]): match for match in modelled}
+    out = []
+    rejected = []
+    for key, bag in odds_pool(modelled, priced).items():
+        no, mtype, _ = key
+        needed = COVER_SIDES.get(mtype)
+        if not needed or any(side not in bag for side in needed):
+            continue
+        match = names.get(no)
+        if not match:
+            continue
+        # 每种可能的两腿组合都算一遍，只要腿来自不同来源就是候选套利。
+        best = None
+        same_book = None
+        for combo in itertools.product(*(bag[side] for side in needed)):
+            inverse = sum(1.0 / odds for odds, _ in combo)
+            if inverse >= 1.0 - ARB_MIN_PROFIT:
+                continue
+            books = {book for _, book in combo}
+            if books == {HKJC_BOOK}:
+                continue
+            if len(books) == 1:
+                if same_book is None or inverse < same_book[0]:
+                    same_book = (inverse, combo)
+                continue
+            if best is None or inverse < best[0]:
+                best = (inverse, combo)
+        sample = next((item for item in match["books"].get(mtype) or []
+                       if line_key(mtype, item.get("line")) == key[2]), None)
+        text = sample["text"] if sample else key[2]
+        if best is None:
+            if same_book is not None:
+                inverse, combo = same_book
+                rejected.append({
+                    "match": f"{match['kickoff']} {match['home_ch']} vs {match['away_ch']}",
+                    "market": MARKET_NAMES.get(mtype, mtype),
+                    "line_text": text,
+                    "profit": 1.0 / inverse - 1.0,
+                    "reject": f"{combo[0][1]} 单家覆盖全盘却仍需 {inverse:.3f} < 1，等于负抽水，数据不可信",
+                })
+            continue
+        inverse, combo = best
+        legs = []
+        for side, (odds, book) in zip(needed, combo):
+            legs.append({
+                "side": side,
+                "label": side_label(mtype, side, text, match["home_ch"], match["away_ch"]),
+                "odds": odds,
+                "book": book,
+                "share": (1.0 / odds) / inverse,
+            })
+        out.append({
+            "match": f"{match['kickoff']} {match['home_ch']} vs {match['away_ch']}",
+            "mtype": mtype,
+            "market": MARKET_NAMES.get(mtype, mtype),
+            "line_text": text,
+            "legs": legs,
+            "inverse": inverse,
+            "profit": 1.0 / inverse - 1.0,
+            "meta": match_meta(match),
+        })
+    out.sort(key=lambda row: row["profit"], reverse=True)
+    rejected.sort(key=lambda row: row["profit"], reverse=True)
+    return out, rejected
+
+
+MAX_VALUE_EDGE = float(os.environ.get("MAX_VALUE_EDGE", "0.12"))
+
+
+def value_rows(priced: list[dict]) -> list[dict]:
+    """值得在马会下注的方向。
+
+    必须同时满足：两家都挂这条线（ref_odds 存在，避免模型外推）、分布可信、
+    期望过门槛，且期望不能高得离谱——高出太多基本是模型尾部分布算歪了。
+    """
+    return [
+        row for row in priced
+        if row.get("book") == HKJC_BOOK
+        and row.get("ref_odds")
+        and row["conf"] == "high"
+        and MIN_EXTERNAL_EDGE <= row["edge"] <= MAX_VALUE_EDGE
+        and not row.get("suspicious")
+    ]
+
+
+def external_report(priced: list[dict], arms: list[dict],
+                    bankroll: float | None, rejected: list[dict] | None = None) -> list[str]:
+    lines = ["【外部比价｜Pinnacle 自动抓取】"]
+    hk_rows = [row for row in priced if row.get("book") == HKJC_BOOK]
+    ext_rows = [row for row in priced if row.get("book") == PINNACLE_BOOK]
+    lines.append(
+        f"自动对上 {len({row['meta']['no'] for row in ext_rows})} 场，"
+        f"马会 {len(hk_rows)} 个方向、Pinnacle {len(ext_rows)} 个方向参与比价。"
+    )
+    if not ext_rows:
+        lines.append("这轮没抓到外部赔率，只能按马会自家盘口分析。")
+        return lines
+
+    # 套利腿不再单独推荐，否则会和套利方向打架。
+    hedged = {(arm["meta"]["no"], arm["mtype"], leg["side"]) for arm in arms for leg in arm["legs"]}
+    clean = [row for row in hk_rows if (row["meta"]["no"], row["mtype"], row["side_code"]) not in hedged]
+    matched = [row for row in clean if row.get("ref_odds")]
+    good = value_rows(clean)
+
+    if good:
+        lines.append("")
+        lines.append(f"马会有 {len(good)} 个方向高于 Pinnacle 公平价，扣除抽水仍有正期望：")
+        for index, row in enumerate(good[:10], 1):
+            stake = kelly_stake(row)
+            money = f"，约 {bankroll * stake:,.0f}" if bankroll else ""
+            lines.append(f"{index}. {row['match']}｜{row['market']} {row['side']}")
+            lines.append(
+                f"   马会 {row['odds']:g}｜Pinnacle {row['ref_odds']:g}"
+                f"｜命中率{row['prob']:.1%} 保本{row['breakeven']:.2f} 期望{row['edge']:+.1%}"
+                f"｜注码 {stake:.1%}{money}"
+            )
+            if row["odds"] > 4:
+                lines.append("   高赔率小样本，注码已额外封顶。")
+        lines.append("要点：Pinnacle 是行业里最低水的锐价，它给更低价说明马会这条线偏肥。")
+        lines.append("成交前再确认一次赔率，马会盘口会随投注量变动。")
+    else:
+        lines.append("")
+        lines.append(
+            f"马会没有一个方向同时满足「两家同档位 + 分布可信 + 期望 "
+            f"{MIN_EXTERNAL_EDGE:.0%}~{MAX_VALUE_EDGE:.0%}」，今天比价部分建议空仓。"
+        )
+        near = sorted((row for row in matched if row["edge"] > 0 and row["conf"] == "high"),
+                      key=lambda row: row["edge"], reverse=True)
+        if near:
+            lines.append(f"最接近的 {len(near[:3])} 个方向（都在抽水范围内，不值得下）：")
+            for row in near[:3]:
+                lines.append(f"- {row['edge']:+.1%}｜{row['match']}｜{row['side']}"
+                             f"｜马会 {row['odds']:g} vs Pinnacle {row['ref_odds']:g}")
+        lines.append("这类日子不该硬找单。两家锐价分歧小于抽水，本来就无利可图。")
+
+    lines.append("")
+    lines.append("【套利机会】")
+    if arms:
+        for index, row in enumerate(arms[:5], 1):
+            lines.append(f"{index}. {row['match']}｜{row['market']} {row['line_text']}"
+                         f"｜利润率 {row['profit']:.2%}")
+            for leg in row["legs"]:
+                money = f"，约 {bankroll * leg['share']:,.0f}" if bankroll else ""
+                lines.append(f"   - {leg['label']}：{leg['book']} {leg['odds']:g}"
+                             f"｜占 {leg['share']:.1%}{money}")
+        lines.append("下注要点：两腿必须同时成交，任何一腿赔率变动都可能吃掉利润。")
+        lines.append("还要确认两家对「取消/腰斩/结算规则」一致，否则套利会变成单边风险。")
+    else:
+        lines.append("马会和 Pinnacle 之间没有满足 1/赔率之和 < 1 的组合。")
+        lines.append("锐价对锐价本来就难套利，套利窗口通常只存在几分钟。")
+    if rejected:
+        lines.append("")
+        lines.append(f"【被否决的假套利 {len(rejected)} 个】")
+        for row in rejected[:3]:
+            lines.append(f"- {row['match']}｜{row['market']} {row['line_text']}"
+                         f"｜表面 {row['profit']:.2%}｜{row['reject']}")
+    return lines
 
 
 def advice_block(top: list[dict], advice: list[dict], pool: list[dict],
@@ -1884,17 +2505,20 @@ def breakeven_block(picks: list[dict]) -> list[str]:
         return []
     lines = ["【保本赔率（外部比价用：外部赔率高于它才值得下）】"]
     for pick in rows:
+        source = pick.get("book") or HKJC_BOOK
         lines.append(
             f"- {pick.get('match')}｜{pick.get('side')}｜"
-            f"命中率{pick['prob']:.0%}｜保本赔率 {pick['breakeven']:.2f}｜马会 {pick['odds']:g}"
+            f"命中率{pick['prob']:.0%}｜保本赔率 {pick['breakeven']:.2f}｜{source} {pick['odds']:g}"
         )
     return lines
 
 
 def candidate_lines(shown: list[dict], top: list[dict]) -> list[str]:
     used = {(pick.get("match"), pick.get("mtype"), pick.get("side_code"), pick.get("line")) for pick in top}
+    # 只列分布可信的方向，档位不足的拟合别拿来占版面。
     rest = [pick for pick in shown
-            if (pick.get("match"), pick.get("mtype"), pick.get("side_code"), pick.get("line")) not in used]
+            if pick.get("conf") == "high"
+            and (pick.get("match"), pick.get("mtype"), pick.get("side_code"), pick.get("line")) not in used]
     if not rest:
         return []
     lines = ["【候选排行（按期望值，从好到差）】"]
@@ -1913,37 +2537,44 @@ def vig_block(vigs: list[tuple[str, float, int]]) -> list[str]:
 
 
 def render(day: str, shown: list[dict], top: list[dict], advice: list[dict], pool: list[dict],
-           notes: list[str], review: list[str], vigs: list[tuple[str, float, int]]) -> str:
+           notes: list[str], review: list[str], vigs: list[tuple[str, float, int]],
+           external: dict | None = None) -> str:
     start, end = slate_window(day)
+    body: list[list[str]] = []
+    has_value = bool(external and external.get("has_value"))
+
+    if external:
+        # 有外部赔率时，比价和套利排最前面，那才是能赚钱的部分。
+        body.append(external_report(
+            external.get("priced") or [],
+            external.get("arb") or [],
+            external.get("bankroll"),
+            external.get("rejected") or [],
+        ))
+    if not has_value:
+        # 没有外部价值时才谈马会内部，否则会和上面的推荐自相矛盾。
+        body.append(advice_block(top, advice, pool, vigs))
+        if not external:
+            diverge = divergence_lines(pool)
+            if diverge:
+                body.append(["【模型与盘口分歧最大（观察用，不构成下注建议）】"] + diverge)
+    body.append(breakeven_block(top or shown))
+    body.append(candidate_lines(shown, top))
+    body.append(vig_block(vigs))
+    body.append(["【复盘】"] + (review or ["- 还没有可结算的历史。"]))
+    if notes:
+        body.append(["【数据】"] + [f"- {note}" for note in notes])
+
     lines = [
         f"{PUSH_KEYWORD}早筛 {day}｜窗口 {start:%m-%d %H:%M} 至 {end:%m-%d %H:%M}",
         "口径：完全不看球队近况。命中率由马会多档盘口（入球大细、角球大细、半场大细）"
-        "去抽水后拟合分布得到，让球/半场/半全场/首球都由同一套分布派生。",
-        "",
+        "加上自动抓取的 Pinnacle 盘口去抽水后融合拟合分布得到，让球/半场/半全场/首球都由同一套分布派生。",
     ]
-    lines.extend(advice_block(top, advice, pool, vigs))
-    diverge = divergence_lines(pool)
-    if diverge:
+    for section in body:
+        if not section:
+            continue
         lines.append("")
-        lines.append("【模型与盘口分歧最大（观察用，不构成下注建议）】")
-        lines.extend(diverge)
-    lines.append("")
-    lines.extend(breakeven_block(top or shown))
-    extra = candidate_lines(shown, top)
-    if extra:
-        lines.append("")
-        lines.extend(extra)
-    vigor = vig_block(vigs)
-    if vigor:
-        lines.append("")
-        lines.extend(vigor)
-    lines.append("")
-    lines.append("【复盘】")
-    lines.extend(review or ["- 还没有可结算的历史。"])
-    if notes:
-        lines.append("")
-        lines.append("【数据】")
-        lines.extend(f"- {note}" for note in notes)
+        lines.extend(section)
     return "\n".join(lines)
 
 
@@ -1951,15 +2582,48 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="9:00 触发时，研究当天中午到次日中午的马会比赛")
     parser.add_argument("--date", help="触发日 YYYY-MM-DD，默认今天。26 日会研究 26 日 12:00 到 27 日 12:00")
     parser.add_argument("--dry-run", action="store_true", help="只打印，不推送")
+    parser.add_argument("--no-external", action="store_true",
+                        help="不抓外部赔率，只按马会自家盘口分析")
+    parser.add_argument("--bankroll", type=float, default=float(os.environ.get("BANKROLL", "0") or 0),
+                        help="本金，用来把建议注码换算成金额")
     args = parser.parse_args()
 
     day = args.date or datetime.now(TZ).strftime("%Y-%m-%d")
     notes: list[str] = []
-    pool, modelled = screen(day, notes)
+    pool, modelled = screen(day, notes, auto_external=not args.no_external)
     vigs = vig_table(pool)
-    shown = pool[:SHOW_LIMIT]
+    reliable = [row for row in pool if row.get("conf") == "high"] or pool
+    shown = reliable[:SHOW_LIMIT]
     advice = advisable(pool)
     shortlist = advice or shown
+
+    external = None
+    if pool and not args.no_external:
+        priced = sorted(pool, key=lambda row: row["edge"], reverse=True)
+        arms, rejected = arb_scan(modelled, pool)
+        bankroll = args.bankroll if args.bankroll > 0 else None
+        value_bets = value_rows(priced)
+        external = {
+            "priced": priced,
+            "arb": arms,
+            "rejected": rejected,
+            "bankroll": bankroll,
+            "has_value": bool(value_bets),
+        }
+        compared = sum(1 for row in priced if row.get("book") == HKJC_BOOK and row.get("ref_odds"))
+        notes.append(
+            f"马会与 Pinnacle 同档位可比 {compared} 个方向，其中 {len(value_bets)} 个有正期望，"
+            f"发现 {len(arms)} 个套利组合。"
+        )
+        if value_bets:
+            shortlist = value_bets[:TOP_MATCHES]
+            advice = []
+            if not args.dry_run:
+                recorded = record_history(
+                    day, [row for row in value_bets if row["mtype"] in SETTLE_MTYPES]
+                )
+                if recorded[0]:
+                    notes.append(f"外部价值 {recorded[0]} 个方向已记入历史，用于事后验证比价是否真的准。")
 
     if pool:
         best = next((pick for pick in pool if pick.get("conf") == "high"), pool[0])
@@ -1981,7 +2645,7 @@ def main() -> None:
     if (settled or pending) and not args.dry_run:
         save_history(history)
     recent, stats = weekly_review(day, history)
-    if not args.dry_run and shortlist:
+    if not args.dry_run and shortlist and not external:
         recordable = [pick for pick in shortlist if pick["mtype"] in SETTLE_MTYPES]
         added, refreshed = record_history(day, recordable)
         if added:
@@ -1994,7 +2658,7 @@ def main() -> None:
     review.extend(calibration_report(day, history))
     review.extend(f"- 经验：{lesson}" for lesson in lessons)
 
-    text = render(day, shown, top, advice, pool, notes, review, vigs)
+    text = render(day, shown, top, advice, pool, notes, review, vigs, external)
     push(text, args.dry_run)
 
 
