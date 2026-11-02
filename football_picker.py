@@ -2511,27 +2511,43 @@ def history_row(day: str, pick: dict, kind: str) -> dict | None:
     }
 
 
-def record_history(day: str, picks: list[dict]) -> int:
+REFRESH_FIELDS = ("kind", "scope", "model", "odds", "prob", "edge", "confidence", "reason",
+                  "depth", "favorite", "total_value", "corner_value", "league", "league_en", "country")
+
+
+def record_history(day: str, picks: list[dict]) -> tuple[int, int]:
+    """返回 (新增条数, 补全条数)。已有的行要补上新算出的赔率和概率，否则校准永远没样本。"""
     rows = load_history()
-    seen = {
-        (row.get("run_day"), row.get("no"), row.get("market"), row.get("side"), row.get("line"))
+    index = {
+        (row.get("run_day"), row.get("no"), row.get("market"), row.get("side"), row.get("line")): row
         for row in rows
     }
     added = 0
+    refreshed = 0
     for pick in picks:
         meta = pick.get("meta") or {}
         row = history_row(day, pick, meta.get("kind") or pick.get("market") or "")
         if row is None:
             continue
         key = (day, row["no"], row["market"], row["side"], row["line"])
-        if key in seen:
+        existing = index.get(key)
+        if existing is None:
+            rows.append(row)
+            index[key] = row
+            added += 1
             continue
-        seen.add(key)
-        rows.append(row)
-        added += 1
-    if added:
+        changed = False
+        for field in REFRESH_FIELDS:
+            new_value = row.get(field)
+            if new_value is None or existing.get(field) == new_value:
+                continue
+            existing[field] = new_value
+            changed = True
+        if changed:
+            refreshed += 1
+    if added or refreshed:
         save_history(rows)
-    return added
+    return added, refreshed
 
 
 def record_observations(day: str, matches: list[dict], picked: list[dict]) -> int:
@@ -3129,7 +3145,9 @@ def render(day, candidates, deep, result, notes, cups, analyzed, board, review=N
         lines.extend(review)
         lines.append("")
     if top:
-        lines.append("【今日三场】")
+        hints = [stake_hint(pick) for pick in top]
+        advice = "都不建议下注" if all(hint == "不下" for hint in hints) else "按命中率排序"
+        lines.append(f"【今日三场｜{advice}】")
         for index, pick in enumerate(top, 1):
             lines.append(
                 f"{index}. {pick.get('match')}｜{pick.get('side')} {pick.get('line')}"
@@ -3416,9 +3434,11 @@ def main() -> None:
     recent, stats = weekly_review(day, history)
     observed = observed_review(day, history)
     if not args.dry_run:
-        added = record_history(day, shown)
+        added, refreshed = record_history(day, shown)
         if added:
             notes.append(f"今天的方向已记入历史 {added} 条，下次跑用 ESPN 赛果回看。")
+        if refreshed:
+            notes.append(f"历史里有 {refreshed} 条补上了赔率和概率，校准开始有样本。")
         watched = record_observations(day, analyzed_matches, shown)
         if watched:
             notes.append(f"另外记下 {watched} 场被跳过的比赛，之后用赛果检验过滤规则。")
