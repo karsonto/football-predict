@@ -23,20 +23,7 @@ import requests
 
 TZ = ZoneInfo("Asia/Shanghai")
 ROOT = Path(__file__).resolve().parent
-API = "https://v3.football.api-sports.io"
-FD_API = "https://api.football-data.org/v4"
 # football-data.org 免费档能读到当前赛季。这里用程序内部的联赛名，方便沿用原有优先级。
-FD_DISPLAY = {
-    "PL": ("England", "Premier League"),
-    "PD": ("Spain", "La Liga"),
-    "SA": ("Italy", "Serie A"),
-    "BL1": ("Germany", "Bundesliga"),
-    "FL1": ("France", "Ligue 1"),
-    "DED": ("Netherlands", "Eredivisie"),
-    "ELC": ("England", "Championship"),
-    "PPL": ("Portugal", "Primeira Liga"),
-    "BSA": ("Brazil", "Serie A"),
-}
 
 
 def load_dotenv(path: Path) -> None:
@@ -57,14 +44,10 @@ FOOTBALL_DATA_KEY = os.environ.get("FOOTBALL_DATA_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com").rstrip("/")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-flash")
-SEARCH_PROVIDER = os.environ.get("SEARCH_PROVIDER", "tavily").lower()
-SEARCH_API_KEY = os.environ.get("SEARCH_API_KEY", "")
 PUSH_TYPE = os.environ.get("PUSH_TYPE", "stdout").lower()
 PUSH_WEBHOOK = os.environ.get("PUSH_WEBHOOK", "")
 PUSH_KEYWORD = os.environ.get("PUSH_KEYWORD", "足球")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-MAX_DEEP = int(os.environ.get("MAX_DEEP", "8"))
-MAX_STANDINGS = int(os.environ.get("MAX_STANDINGS", "30"))
 
 
 class ApiError(RuntimeError):
@@ -86,78 +69,10 @@ def is_friendly(name: str) -> bool:
     return "friendly" in n or "friendlies" in n
 
 
-def is_cup(name: str) -> bool:
-    n = norm(name)
-    return any(k in n for k in ("cup", "copa", "coupe", "pokal", "trophy"))
 
 
-def is_serious_cup(name: str) -> bool:
-    n = norm(name)
-    return any(k in n for k in ("fa cup", "copa del rey", "dfb-pokal", "dfb pokal"))
 
 
-def is_caution_cup(country: str, name: str) -> bool:
-    c, n = norm(country), norm(name)
-    if ("emirates" in c or c == "uae") and "president" in n:
-        return True
-    if "saudi" in c and is_cup(name):
-        return True
-    return False
-
-
-def is_big5(country: str, name: str) -> bool:
-    c, n = norm(country), norm(name)
-    table = {
-        "england": "premier league",
-        "spain": "la liga",
-        "italy": "serie a",
-        "germany": "bundesliga",
-        "france": "ligue 1",
-    }
-    return table.get(c) == n
-
-
-def is_focus_league(country: str, name: str) -> bool:
-    c, n = norm(country), norm(name)
-    if c == "finland" and "veikkausliiga" in n:
-        return True
-    if c == "norway" and "eliteserien" in n:
-        return True
-    if "saudi" in c and "pro league" in n:
-        return True
-    if c == "japan" and n in ("j1 league", "j1"):
-        return True
-    return False
-
-
-def style_hint(country: str, name: str) -> str:
-    c, n = norm(country), norm(name)
-    if c == "netherlands" or "eredivisie" in n:
-        return "联赛先验：大球较多。只有这场近况也支持大球时才加重。"
-    if "saudi" in c or "emirates" in c or c == "uae":
-        return "联赛先验：大球较多。只有这场近况也支持大球时才加重。"
-    if c == "australia" or "a-league" in n:
-        return "联赛先验：大球、大角较多。只有这场近况也支持时才加重。"
-    if "korea" in c or "k league" in n:
-        return "联赛先验：小球较多。小球不做，只有让球方或大角自己成立才保留。"
-    return ""
-
-
-def football_data_code(country: str, name: str) -> str | None:
-    key = (norm(country), norm(name))
-    aliases = {
-        ("england", "premier league"): "PL",
-        ("spain", "la liga"): "PD",
-        ("spain", "primera division"): "PD",
-        ("italy", "serie a"): "SA",
-        ("germany", "bundesliga"): "BL1",
-        ("france", "ligue 1"): "FL1",
-        ("netherlands", "eredivisie"): "DED",
-        ("england", "championship"): "ELC",
-        ("portugal", "primeira liga"): "PPL",
-        ("brazil", "serie a"): "BSA",
-    }
-    return aliases.get(key)
 
 
 def squash_name(name: str) -> str:
@@ -167,129 +82,17 @@ def squash_name(name: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def priority(country: str, name: str) -> int:
-    if is_big5(country, name):
-        return 0
-    if is_focus_league(country, name):
-        return 1
-    if is_serious_cup(name):
-        return 2
-    if is_caution_cup(country, name):
-        return 5
-    if is_cup(name):
-        return 4
-    return 3
 
 
-def cache_path(day: str) -> Path:
-    folder = ROOT / ".cache"
-    folder.mkdir(exist_ok=True)
-    return folder / f"standings-{day}.json"
 
 
-def load_disk(day: str) -> dict:
-    path = cache_path(day)
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text(encoding="utf-8"))
 
-
-def save_disk(day: str, cache: dict) -> None:
-    cache_path(day).write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
-
-
-class ApiFootball:
-    def __init__(self, key: str):
-        self.s = requests.Session()
-        self.s.headers["x-apisports-key"] = key
-
-    def get(self, path: str, params: dict) -> list:
-        items = []
-        page = 1
-        total = 1
-        while page <= total:
-            query = dict(params)
-            if page > 1:
-                query["page"] = page
-            resp = self.s.get(API + path, params=query, timeout=40)
-            if resp.status_code == 429:
-                raise ApiError("API-Football 请求额度用尽")
-            resp.raise_for_status()
-            body = resp.json()
-            errors = body.get("errors")
-            if errors:
-                if page > 1 and "page" in str(errors).lower():
-                    break
-                raise ApiError(str(errors))
-            items.extend(body.get("response") or [])
-            total = int((body.get("paging") or {}).get("total") or 1)
-            page += 1
-        return items
-
-
-def load_standings(api: ApiFootball, league_id: int, season: int, day: str, disk: dict):
-    key = f"{league_id}:{season}"
-    if key in disk:
-        return disk[key]
-    blocks = api.get("/standings", {"league": league_id, "season": season})
-    table = None
-    if blocks:
-        groups = blocks[0]["league"]["standings"]
-        if len(groups) == 1:
-            table = groups[0]
-    disk[key] = table
-    save_disk(day, disk)
-    return table
-
-
-def tag_rows(table: list[dict]) -> dict[int, dict]:
-    total = len(table)
-    out = {}
-    for row in table:
-        rank = int(row["rank"])
-        flags = []
-        if rank <= 3:
-            flags.append("前三")
-        if total >= 6 and rank > total - 3:
-            flags.append("后三")
-        elif total < 6 and rank > 3:
-            flags.append("后段")
-        out[int(row["team"]["id"])] = {
-            "rank": rank,
-            "total": total,
-            "flags": flags,
-            "name": row["team"].get("name") or "",
-        }
-    return out
-
-
-def rank_text(info: dict | None) -> str:
-    if not info:
-        return "排名未知"
-    flags = "、".join(info["flags"]) if info["flags"] else "中游"
-    return f"第{info['rank']}/{info['total']}（{flags}）"
-
-
-def why_text(home_info, away_info) -> str:
-    parts = []
-    if home_info and home_info["flags"]:
-        parts.append("主队" + "、".join(home_info["flags"]))
-    if away_info and away_info["flags"]:
-        parts.append("客队" + "、".join(away_info["flags"]))
-    return "，".join(parts)
 
 
 def kickoff_local(iso: str) -> datetime:
     return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(TZ)
 
 
-def match_title(match: dict) -> str:
-    home = match.get("home_ch") or match["home"]
-    away = match.get("away_ch") or match["away"]
-    number = match.get("hkjc_no") or ""
-    return f"{number} {home} vs {away}".strip()
-
-
 def squash_name(name: str) -> str:
     text = norm(name).replace("&", " and ")
     for word in ("fc", "afc", "cf", "sc", "ac"):
@@ -297,235 +100,41 @@ def squash_name(name: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def football_data_code(country: str, name: str) -> str | None:
-    key = (norm(country), norm(name))
-    aliases = {
-        ("england", "premier league"): "PL",
-        ("spain", "la liga"): "PD",
-        ("spain", "primera division"): "PD",
-        ("italy", "serie a"): "SA",
-        ("germany", "bundesliga"): "BL1",
-        ("france", "ligue 1"): "FL1",
-        ("netherlands", "eredivisie"): "DED",
-        ("england", "championship"): "ELC",
-        ("portugal", "primeira liga"): "PPL",
-        ("brazil", "serie a"): "BSA",
-    }
-    return aliases.get(key)
 
-
-class FootballData:
-    def __init__(self, key: str):
-        self.s = requests.Session()
-        self.s.headers["X-Auth-Token"] = key
-
-    def get(self, path: str, params: dict | None = None) -> dict:
-        resp = self.s.get(FD_API + path, params=params or {}, timeout=40)
-        if resp.status_code == 429:
-            time.sleep(7)
-            resp = self.s.get(FD_API + path, params=params or {}, timeout=40)
-        if resp.status_code == 429:
-            raise ApiError("football-data.org 请求过于频繁")
-        resp.raise_for_status()
-        return resp.json()
-
-
-def load_fd_standings(fd: FootballData, code: str, day: str, disk: dict):
-    key = f"fd:{code}"
-    if key in disk:
-        return disk[key]
-    body = fd.get(f"/competitions/{code}/standings")
-    table = None
-    for block in body.get("standings") or []:
-        if block.get("type") == "TOTAL":
-            table = [
-                {
-                    "rank": row["position"],
-                    "team": {"id": row["team"]["id"], "name": row["team"]["name"]},
-                }
-                for row in block.get("table") or []
-            ]
-            break
-    disk[key] = table
-    save_disk(day, disk)
-    return table
-
-
-def fd_matches_as_fixtures(fd: FootballData, day: str) -> list[dict]:
-    day_dt = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=TZ)
-    # dateTo 是开区间。多取前后各一天，再按北京时间过滤。
-    start = (day_dt - timedelta(days=1)).strftime("%Y-%m-%d")
-    end = (day_dt + timedelta(days=1)).strftime("%Y-%m-%d")
-    body = fd.get("/matches", {"dateFrom": start, "dateTo": end})
-    fixtures = []
-    for match in body.get("matches") or []:
-        code = (match.get("competition") or {}).get("code")
-        if code not in FD_DISPLAY:
-            continue
-        when = kickoff_local(match["utcDate"])
-        if when.strftime("%Y-%m-%d") != day:
-            continue
-        country, name = FD_DISPLAY[code]
-        status = match.get("status") or ""
-        short = "NS" if status in ("TIMED", "SCHEDULED") else status
-        fixtures.append({
-            "league": {
-                "id": 1_000_000 + int(match["competition"]["id"]),
-                "name": name,
-                "country": country,
-                "season": 2026,
-            },
-            "fixture": {"date": match["utcDate"], "status": {"short": short}},
-            "teams": {
-                "home": {
-                    "id": match["homeTeam"]["id"],
-                    "name": match["homeTeam"].get("shortName") or match["homeTeam"]["name"],
-                },
-                "away": {
-                    "id": match["awayTeam"]["id"],
-                    "name": match["awayTeam"].get("shortName") or match["awayTeam"]["name"],
-                },
-            },
-        })
-    return fixtures
 
 
 # API-Football 免费档不给超出近三天的赛程。这些联赛用 ESPN 的公开比分榜补上，积分榜也从同一来源取，球队编号才能对上。
-ESPN_LEAGUES = [
-    ("jpn.1", "Japan", "J1 League"),
-    ("ksa.1", "Saudi-Arabia", "Pro League"),
-    ("nor.1", "Norway", "Eliteserien"),
-    ("fin.1", "Finland", "Veikkausliiga"),
-    ("aus.1", "Australia", "A-League"),
-    ("usa.1", "USA", "MLS"),
-    ("eng.1", "England", "Premier League"),
-    ("esp.1", "Spain", "La Liga"),
-    ("ita.1", "Italy", "Serie A"),
-    ("ger.1", "Germany", "Bundesliga"),
-    ("fra.1", "France", "Ligue 1"),
-    ("ned.1", "Netherlands", "Eredivisie"),
-    ("por.1", "Portugal", "Primeira Liga"),
-    ("bra.1", "Brazil", "Serie A"),
-    ("eng.2", "England", "Championship"),
-    ("afc.champions", "Asia", "AFC Champions League Elite"),
-    ("den.1", "Denmark", "Superliga"),
-    ("fra.2", "France", "Ligue 2"),
-]
 
-
-def espn_fixtures(day: str, include_covered: bool) -> list[dict]:
-    fixtures = []
-    selected = [
-        (index, slug, country, name)
-        for index, (slug, country, name) in enumerate(ESPN_LEAGUES)
-        if include_covered or not football_data_code(country, name)
-    ]
-    for index, slug, country, name in selected:
-        resp = requests.get(
-            f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard",
-            params={"dates": day.replace("-", "")},
-            timeout=30,
-        )
-        if resp.status_code == 400:
-            continue
-        resp.raise_for_status()
-        for event in resp.json().get("events") or []:
-            when = kickoff_local(event["date"])
-            if when.strftime("%Y-%m-%d") != day:
-                continue
-            competition = event["competitions"][0]
-            status_name = ((competition.get("status") or {}).get("type") or {}).get("name") or ""
-            short = "NS" if status_name in ("STATUS_SCHEDULED", "STATUS_PREGAME") else status_name
-            teams = {item.get("homeAway"): item.get("team") or {} for item in competition.get("competitors") or []}
-            home = teams.get("home") or {}
-            away = teams.get("away") or {}
-            if not home.get("id") or not away.get("id"):
-                continue
-            fixtures.append({
-                "league": {
-                    "id": 3_000_000 + index,
-                    "name": name,
-                    "country": country,
-                    "season": 2026,
-                    "espn": slug,
-                },
-                "fixture": {"date": event["date"], "status": {"short": short}},
-                "teams": {
-                    "home": {"id": 2_000_000 + int(home["id"]), "name": home.get("displayName") or home.get("name")},
-                    "away": {"id": 2_000_000 + int(away["id"]), "name": away.get("displayName") or away.get("name")},
-                },
-            })
-    return fixtures
-
-
-def load_espn_standings(slug: str, day: str, disk: dict):
-    key = f"espn:{slug}"
-    if key in disk:
-        return disk[key]
-    resp = requests.get(
-        f"https://site.api.espn.com/apis/v2/sports/soccer/{slug}/standings",
-        timeout=30,
-    )
-    resp.raise_for_status()
-    children = resp.json().get("children") or []
-    table = None
-    if children:
-        entries = ((children[0].get("standings") or {}).get("entries")) or []
-        rows = []
-        for entry in entries:
-            rank = next((s.get("value") for s in entry.get("stats") or [] if s.get("name") == "rank"), None)
-            team = entry.get("team") or {}
-            if rank is None or not team.get("id"):
-                continue
-            rows.append({
-                "rank": int(rank),
-                "team": {
-                    "id": 2_000_000 + int(team["id"]),
-                    "name": team.get("displayName") or team.get("name") or "",
-                },
-            })
-        if rows:
-            table = rows
-    disk[key] = table
-    save_disk(day, disk)
-    return table
 
 
 HKJC_LEAGUES = {
     "English Premier": ("England", "Premier League"),
+    "English Premier League": ("England", "Premier League"),
     "English Championship": ("England", "Championship"),
     "Spanish Division 1": ("Spain", "La Liga"),
+    "Spanish Division 2": ("Spain", "La Liga 2"),
     "Italian Division 1": ("Italy", "Serie A"),
+    "Italian Division 2": ("Italy", "Serie B"),
     "German Division 1": ("Germany", "Bundesliga"),
+    "German Division 2": ("Germany", "2. Bundesliga"),
     "French Division 1": ("France", "Ligue 1"),
+    "French Division 2": ("France", "Ligue 2"),
     "Dutch Division 1": ("Netherlands", "Eredivisie"),
+    "Dutch Division 2": ("Netherlands", "Eerste Divisie"),
     "Portuguese Premier": ("Portugal", "Primeira Liga"),
     "Brazilian Division 1": ("Brazil", "Serie A"),
+    "Brazilian Division 2": ("Brazil", "Serie B"),
+    "Argentine Division 1": ("Argentina", "Liga Profesional"),
+    "Chilean Division 1": ("Chile", "Primera Division"),
+    "Uruguayan Division 1": ("Uruguay", "Primera Division"),
+    "Swedish Division 1": ("Sweden", "Superettan"),
+    "Finnish Division 1": ("Finland", "Ykkosliiga"),
+    "Russian Premier": ("Russia", "Premier League"),
+    "Thai League 1": ("Thailand", "Thai League 1"),
     "Asian Champions League Elite": ("Asia", "AFC Champions League Elite"),
     "Danish Superliga": ("Denmark", "Superliga"),
-    "French Division 2": ("France", "Ligue 2"),
 }
 
-# 这些赛事不按积分榜前三后三筛，按强队身份、进球和近况看。
-FOCUS_LEAGUE_NAMES = {
-    "AFC Champions League Elite",
-    "Superliga",
-    "Ligue 1",
-    "Ligue 2",
-    "Primeira Liga",
-}
-
-STRONG_CLUBS = (
-    ("al ittihad", "沙特传统强队"),
-    ("al ahli", "沙特传统强队"),
-    ("al hilal", "沙特传统强队"),
-    ("al nassr", "沙特传统强队"),
-    ("al ain", "阿联酋强队，上赛季联赛不败拿到亚冠资格"),
-    ("benfica", "葡超豪门"),
-    ("porto", "葡超豪门"),
-    ("sporting", "葡超豪门"),
-    ("paris saint germain", "法甲豪门"),
-)
 
 HKJC_QUERY = '''
 query matchList($startIndex: Int, $endIndex: Int,$startDate: String, $endDate: String, $matchIds: [String], $tournIds: [String], $fbOddsTypes: [FBOddsType]!, $fbOddsTypesM: [FBOddsType]!, $inplayOnly: Boolean, $featuredMatchesOnly: Boolean, $frontEndIds: [String], $earlySettlementOnly: Boolean, $showAllMatch: Boolean) {
@@ -782,21 +391,6 @@ def hkjc_card() -> list[dict]:
     return cached_json("hkjc-open-card-v2.json", load, max_age_hours=0.25)
 
 
-def rank_by_name(ranks: dict | None, name: str) -> dict | None:
-    if not ranks or not name:
-        return None
-    best = None
-    best_score = 0
-    for info in ranks.values():
-        score = name_score(name, info.get("name") or "")
-        if score > best_score:
-            best_score = score
-            best = info
-    if best_score >= 60:
-        return best
-    return None
-
-
 def slate_window(day: str) -> tuple[datetime, datetime]:
     """触发日中午到次日中午。26 日 9:00 跑，就是 26 日 12:00 到 27 日 12:00。"""
     trigger = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=TZ)
@@ -805,166 +399,40 @@ def slate_window(day: str) -> tuple[datetime, datetime]:
     return start, end
 
 
-def build_candidates(api: ApiFootball | None, fd: FootballData | None, day: str):
-    start, end = slate_window(day)
-    notes = [f"研究 {start:%m-%d %H:%M} 至 {end:%m-%d %H:%M} 的马会比赛。"]
-    try:
-        card = hkjc_card()
-    except (ApiError, requests.RequestException) as exc:
-        notes.append(f"马会赛程失败：{exc}")
-        return [], notes, [], [], [], []
-    now = datetime.now(TZ)
-    playing = []
-    started = 0
-    for item in card:
-        if not item.get("kickoff"):
-            continue
-        when = kickoff_local(item["kickoff"])
-        if not (start <= when < end):
-            continue
-        if item["status"] != "PREEVENT" or when < now:
-            started += 1
-            continue
-        if is_women_or_youth(item["tournament_en"]) or is_friendly(item["tournament_en"]):
-            continue
-        playing.append((when, item))
-    if started:
-        notes.append(f"这个时间窗里另有 {started} 场已开赛，没有研究。")
-    if not playing:
-        notes.append("这个时间窗里马会没有未开赛的场次。")
-        return [], notes, [], [], [], []
-
-    disk = load_disk(day)
-    leagues: dict[str, dict] = {}
-    for when, item in playing:
-        country, league_name = HKJC_LEAGUES.get(item["tournament_en"], ("", item["tournament_en"]))
-        key = item["tournament_en"]
-        bucket = leagues.get(key)
-        if bucket is None:
-            bucket = {
-                "name": league_name,
-                "country": country,
-                "mapped": bool(country),
-                "ranks": None,
-                "items": [],
-            }
-            leagues[key] = bucket
-        bucket["items"].append((when, item))
-
-    for league in leagues.values():
-        if not league["mapped"] or league["name"] in FOCUS_LEAGUE_NAMES:
-            continue
-        code = football_data_code(league["country"], league["name"])
-        slug = espn_slug_for(league["country"], league["name"])
-        try:
-            if code and fd is not None:
-                table = load_fd_standings(fd, code, day, disk)
-            elif slug:
-                table = load_espn_standings(slug, day, disk)
-            else:
-                table = None
-        except (ApiError, requests.RequestException) as exc:
-            notes.append(f"积分榜失败 {league['name']}：{exc}")
-            continue
-        if table:
-            league["ranks"] = tag_rows(table)
-        else:
-            notes.append(f"无单一积分榜：{league['name']}")
-
-    candidates = []
-    plain = []
-    focus = []
-    board = []
-    for league in leagues.values():
-        for when, item in league["items"]:
-            home_info = rank_by_name(league["ranks"], item["home"]) if league["mapped"] else None
-            away_info = rank_by_name(league["ranks"], item["away"]) if league["mapped"] else None
-            hdc = item["hdc"] or "让球未开"
-            row = {
-                "kickoff": when.strftime("%H:%M"),
-                "sort": when.isoformat(),
-                "country": league["country"],
-                "league": item["tournament_ch"],
-                "league_en": league["name"],
-                "home": item["home"],
-                "away": item["away"],
-                "home_ch": item["home_ch"],
-                "away_ch": item["away_ch"],
-                "hkjc_no": item["no"],
-                "priority": priority(league["country"], league["name"]) if league["mapped"] else 3,
-                "style": style_hint(league["country"], league["name"]) if league["mapped"] else "",
-                "caution": False,
-                "serious_cup": False,
-                "home_rank": rank_text(home_info),
-                "away_rank": rank_text(away_info),
-                "hkjc": {
-                    "home_line": item["home_line"],
-                    "total": item["total"],
-                    "total_text": item.get("total_text"),
-                    "corner_line": item["corner_line"],
-                    "hdc": item["hdc"],
-                    "prices": item.get("prices") or {},
-                    "markets": item.get("markets") or {},
-                    "book": "马会",
-                },
-                "line_text": hdc,
-            }
-            home_hit = bool(home_info and home_info["flags"])
-            away_hit = bool(away_info and away_info["flags"])
-            if league["name"] in FOCUS_LEAGUE_NAMES:
-                row["why"] = "按强队身份、进球和近况"
-                focus.append(row)
-            elif league["mapped"] and (home_hit or away_hit):
-                row["why"] = why_text(home_info, away_info)
-                candidates.append(row)
-            elif league["mapped"] and home_info and away_info:
-                row["why"] = "中游对中游"
-                plain.append(row)
-            else:
-                if not league["mapped"]:
-                    row["why"] = "马会有开，没有用来判断前三后三的积分榜"
-                elif not league["ranks"]:
-                    row["why"] = "积分榜没读到，不能判断是不是前三后三"
-                else:
-                    row["why"] = "队名没有对上积分榜"
-                board.append(row)
-    candidates.sort(key=lambda match: (match["priority"], match["sort"]))
-    plain.sort(key=lambda match: (match["priority"], match["sort"]))
-    focus.sort(key=lambda match: match["sort"])
-    board.sort(key=lambda match: match["sort"])
-    return candidates, notes, [], board, plain, focus
 
 
-
-def search(query: str) -> list[str]:
-    if SEARCH_PROVIDER == "serper":
-        resp = requests.post(
-            "https://google.serper.dev/search",
-            headers={"X-API-KEY": SEARCH_API_KEY, "Content-Type": "application/json"},
-            json={"q": query, "num": 5, "hl": "zh-cn"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return [
-            f"{item.get('title', '')} | {item.get('snippet', '')}"
-            for item in (resp.json().get("organic") or [])[:5]
-        ]
-    resp = requests.post(
-        "https://api.tavily.com/search",
-        json={
-            "api_key": SEARCH_API_KEY,
-            "query": query,
-            "max_results": 5,
-            "search_depth": "basic",
-            "include_answer": False,
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return [
-        f"{item.get('title', '')} | {(item.get('content') or '')[:400]}"
-        for item in (resp.json().get("results") or [])[:5]
-    ]
+ESPN_LEAGUES = [
+    ("jpn.1", "Japan", "J1 League"),
+    ("ksa.1", "Saudi-Arabia", "Pro League"),
+    ("nor.1", "Norway", "Eliteserien"),
+    ("fin.1", "Finland", "Veikkausliiga"),
+    ("aus.1", "Australia", "A-League"),
+    ("usa.1", "USA", "MLS"),
+    ("eng.1", "England", "Premier League"),
+    ("esp.1", "Spain", "La Liga"),
+    ("esp.2", "Spain", "La Liga 2"),
+    ("ita.1", "Italy", "Serie A"),
+    ("ita.2", "Italy", "Serie B"),
+    ("ger.1", "Germany", "Bundesliga"),
+    ("ger.2", "Germany", "2. Bundesliga"),
+    ("fra.1", "France", "Ligue 1"),
+    ("ned.1", "Netherlands", "Eredivisie"),
+    ("ned.2", "Netherlands", "Eerste Divisie"),
+    ("por.1", "Portugal", "Primeira Liga"),
+    ("bra.1", "Brazil", "Serie A"),
+    ("bra.2", "Brazil", "Serie B"),
+    ("arg.1", "Argentina", "Liga Profesional"),
+    ("chi.1", "Chile", "Primera Division"),
+    ("uru.1", "Uruguay", "Primera Division"),
+    ("swe.2", "Sweden", "Superettan"),
+    ("fin.2", "Finland", "Ykkosliiga"),
+    ("rus.1", "Russia", "Premier League"),
+    ("tha.1", "Thailand", "Thai League 1"),
+    ("eng.2", "England", "Championship"),
+    ("afc.champions", "Asia", "AFC Champions League Elite"),
+    ("den.1", "Denmark", "Superliga"),
+    ("fra.2", "France", "Ligue 2"),
+]
 
 
 def espn_slug_for(country: str, name: str) -> str | None:
@@ -1242,55 +710,7 @@ def asian_ev(win: float, push: float, odds: float) -> float:
     return win * (odds - 1) - (1 - win - push)
 
 
-def over_win_push(lam_home: float, lam_away: float, line: float) -> tuple[float, float]:
-    """返回 (命中概率, 走水概率)。"""
-    ph = poisson_pmf(lam_home)
-    pa = poisson_pmf(lam_away)
-    parts = split_outcome(line)
-    win = {part: 0.0 for part in parts}
-    push = {part: 0.0 for part in parts}
-    for i, home_p in enumerate(ph):
-        for j, away_p in enumerate(pa):
-            p = home_p * away_p
-            goals = i + j
-            for part in parts:
-                if goals > part + 1e-9:
-                    win[part] += p
-                elif abs(goals - part) < 1e-9:
-                    push[part] += p
-    n = len(parts)
-    return sum(win.values()) / n, sum(push.values()) / n
 
-
-def cover_win_push(lam_home: float, lam_away: float, depth: float, favorite_home: bool) -> tuple[float, float]:
-    ph = poisson_pmf(lam_home)
-    pa = poisson_pmf(lam_away)
-    parts = split_outcome(depth)
-    win = {part: 0.0 for part in parts}
-    push = {part: 0.0 for part in parts}
-    for i, home_p in enumerate(ph):
-        for j, away_p in enumerate(pa):
-            p = home_p * away_p
-            margin = i - j if favorite_home else j - i
-            for part in parts:
-                if margin > part + 1e-9:
-                    win[part] += p
-                elif abs(margin - part) < 1e-9:
-                    push[part] += p
-    n = len(parts)
-    return sum(win.values()) / n, sum(push.values()) / n
-
-
-def double_chance_view(lam_home: float, lam_away: float, scope: str) -> float:
-    """主队不败 / 客队不败：平局算赢。"""
-    ph = poisson_pmf(lam_home)
-    pa = poisson_pmf(lam_away)
-    prob = 0.0
-    for i, home_p in enumerate(ph):
-        for j, away_p in enumerate(pa):
-            if (scope == "home" and i >= j) or (scope == "away" and j >= i):
-                prob += home_p * away_p
-    return prob
 
 
 def corner_lambda(home: dict, away: dict) -> float | None:
@@ -1305,715 +725,29 @@ def corner_lambda(home: dict, away: dict) -> float | None:
     return round(shrunk_rate(totals, 10.0), 3)
 
 
-def odds_for(card: dict, market: str, side: str) -> float | None:
-    prices = (card or {}).get("prices") or {}
-    if market == "大球":
-        rows, want = prices.get("HIL") or [], "H"
-    elif market == "大角":
-        rows, want = prices.get("CHL") or [], "H"
-    elif market == "让球":
-        if "不败" in str(side):
-            return double_chance_odds(card, "home" if "主队" in str(side) else "away")
-        rows = prices.get("HDC") or []
-        want = "H" if side == "主队让球" else "A"
-    else:
-        return None
-    return next((row["odds"] for row in rows if row["str"] == want and row.get("odds")), None)
 
 
-def double_chance_odds(card: dict, scope: str) -> float | None:
-    """同时押两个结果、保证回报相等时的等效赔率。"""
-    had = ((card or {}).get("markets") or {}).get("had") or {}
-    keys = ("H", "D") if scope == "home" else ("A", "D")
-    odds = [had.get(key) for key in keys]
-    if not all(odds):
-        return None
-    combined = odds[0] * odds[1] / (odds[0] + odds[1])
-    # 低于这个价位就算赢也几乎没有回报，不值得作为推荐。
-    if combined < 1.05:
-        return None
-    return round(combined, 3)
 
 
-def market_view(card: dict, home_report: dict, away_report: dict) -> dict:
-    """三种口径各算一套期望进球，方便之后用赛果比较谁更准。"""
-    return {
-        "market": market_lambdas(card),
-        "form": goal_expectation(home_report, away_report),
-        "blended": blended_lambdas(card, home_report, away_report),
-    }
 
 
-def pick_probability(pick: dict, meta: dict, lam: tuple[float, float] | None, odds: float | None) -> dict:
-    """用融合后的期望进球算命中概率和期望值。"""
-    result = {"prob": None, "edge": None, "odds": odds}
-    if odds is None or lam is None:
-        return result
-    market = pick.get("market")
-    side = str(pick.get("side") or "")
-    if market == "让球" and "不败" in side:
-        scope = "home" if "主队" in side else "away"
-        prob = double_chance_view(lam[0], lam[1], scope)
-        result["prob"] = round(prob, 3)
-        result["edge"] = round(prob * (odds - 1) - (1 - prob), 3)
-        return result
-    if market == "让球":
-        if meta.get("depth") is None or not meta.get("favorite"):
-            return result
-        win, push = cover_win_push(lam[0], lam[1], float(meta["depth"]), meta["favorite"] == "home")
-    elif market == "大球":
-        if meta.get("total_value") is None:
-            return result
-        win, push = over_win_push(lam[0], lam[1], float(meta["total_value"]))
-    elif market == "大角":
-        corners = meta.get("corner_lam")
-        if corners is None or meta.get("corner_value") is None:
-            return result
-        win, push = over_win_push(corners / 2, corners / 2, float(meta["corner_value"]))
-    else:
-        return result
-    result["prob"] = round(win, 3)
-    result["edge"] = round(asian_ev(win, push, odds), 3)
-    return result
 
 
-def recent_lines_for_team(slug: str, team: dict, before: datetime) -> list[dict]:
-    team_id = str(team["id"])
-
-    def load_schedule():
-        body = espn_get(f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/teams/{team_id}/schedule")
-        rows = []
-        for event in body.get("events") or []:
-            competition = (event.get("competitions") or [{}])[0]
-            status = ((competition.get("status") or {}).get("type") or {}).get("name") or ""
-            if status not in ("STATUS_FULL_TIME", "STATUS_FINAL", "STATUS_FINAL_AET", "STATUS_FINAL_PEN"):
-                continue
-            if "friendly" in (event.get("name") or "").lower():
-                continue
-            rows.append({
-                "id": event.get("id"),
-                "date": event.get("date"),
-                "name": event.get("name") or "",
-                "competitors": [
-                    {
-                        "id": item.get("team", {}).get("id") or item.get("id"),
-                        "name": item.get("team", {}).get("displayName") or item.get("team", {}).get("name"),
-                        "homeAway": item.get("homeAway"),
-                        "score": item.get("score"),
-                    }
-                    for item in competition.get("competitors") or []
-                ],
-            })
-        return rows
-
-    run_day = datetime.now(TZ).strftime("%Y-%m-%d")
-    schedule = cached_json(
-        f"espn-schedule-{slug}-{team_id}-{run_day}.json",
-        load_schedule,
-        max_age_hours=12,
-    )
-    played = []
-    for event in schedule:
-        if not event.get("date"):
-            continue
-        when = kickoff_local(event["date"])
-        if when >= before:
-            continue
-        played.append(event)
-    played.sort(key=lambda item: item["date"], reverse=True)
-    games = []
-    for event in played[:6]:
-        facts = match_facts(slug, event)
-        if facts is None:
-            continue
-        own = next((item for item in facts["sides"] if str(item["id"]) == team_id), None)
-        if own is None:
-            continue
-        opponent = next((item for item in facts["sides"] if str(item["id"]) != team_id), None)
-        own_score = own.get("score")
-        opp_score = opponent.get("score") if opponent else None
-        outcome = None
-        margin = None
-        if own_score is not None and opp_score is not None:
-            margin = own_score - opp_score
-            if margin > 0:
-                outcome = "胜"
-            elif margin < 0:
-                outcome = "负"
-            else:
-                outcome = "平"
-        place = "主场" if own["homeAway"] == "home" else "客场"
-        line = own.get("line")
-        result = own.get("result")
-        if line is None or not result:
-            role = "让球未知"
-        elif line < 0:
-            role = f"让{line:+g} 让球方{result}"
-        elif line > 0:
-            role = f"让{line:+g} 受让{result}，不算穿盘"
-        else:
-            role = f"让0 {result}"
-        total_text = ""
-        if facts.get("total_line") is not None and facts.get("total_result"):
-            total_text = f" 大{facts['total_line']:g}{facts['total_result']}"
-        if own.get("corners") is not None and facts.get("corner_total") is not None:
-            corner_text = f" 本队角球{own['corners']} 全场{facts['corner_total']}"
-        else:
-            corner_text = " 角球未知"
-        date = kickoff_local(event["date"]).strftime("%m-%d")
-        outcome_text = f"{outcome} " if outcome else ""
-        games.append({
-            "date": date,
-            "text": f"{date} {place} {outcome_text}{facts['scoreline']} {role}{total_text}{corner_text}",
-            "line": line,
-            "result": result,
-            "outcome": outcome,
-            "margin": margin,
-            "total_line": facts.get("total_line"),
-            "total_result": facts.get("total_result"),
-            "corner_total": facts.get("corner_total"),
-        })
-    return games
 
 
-def parse_signed_line(raw) -> float | None:
-    if raw is None:
-        return None
-    text = str(raw).strip().lower().replace("+", "")
-    if text in ("pk", "even", "0", "0.0"):
-        return 0.0
-    try:
-        return float(text)
-    except ValueError:
-        return None
 
 
-def parse_home_line(odds: dict) -> float | None:
-    point = ((odds.get("pointSpread") or {}).get("home") or {}).get("close") or {}
-    if point.get("line") not in (None, ""):
-        return parse_signed_line(point.get("line"))
-    if odds.get("spread") not in (None, ""):
-        return parse_signed_line(odds.get("spread"))
-    return None
 
 
-def parse_total_line(odds: dict) -> float | None:
-    if odds.get("overUnder") not in (None, ""):
-        try:
-            return float(odds["overUnder"])
-        except (TypeError, ValueError):
-            pass
-    raw = (((odds.get("total") or {}).get("over") or {}).get("close") or {}).get("line")
-    if raw in (None, ""):
-        return None
-    return parse_signed_line(str(raw).lower().replace("o", "").replace("u", ""))
 
 
-def match_facts(slug: str, event: dict) -> dict | None:
-    event_id = event.get("id")
-    if not event_id:
-        return None
-
-    def load():
-        body = espn_get(
-            f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/summary",
-            {"event": event_id},
-        )
-        corners = {}
-        for team in (body.get("boxscore") or {}).get("teams") or []:
-            team_id = str((team.get("team") or {}).get("id") or "")
-            for stat in team.get("statistics") or []:
-                if stat.get("name") == "wonCorners" and str(stat.get("displayValue") or "").isdigit():
-                    corners[team_id] = int(stat["displayValue"])
-        odds = (body.get("odds") or [None])[0] or {}
-        return {
-            "corners": corners,
-            "home_line": parse_home_line(odds),
-            "total_line": parse_total_line(odds),
-        }
-
-    try:
-        extra = cached_json(f"espn-summary2-{event_id}.json", load)
-    except requests.RequestException:
-        return None
-    def score_value(raw) -> int | None:
-        if isinstance(raw, dict):
-            raw = raw.get("displayValue") if raw.get("displayValue") is not None else raw.get("value")
-        if raw is None:
-            return None
-        try:
-            return int(float(raw))
-        except (TypeError, ValueError):
-            return None
-
-    sides = []
-    home_goals = away_goals = None
-    home_name = away_name = ""
-    for item in event.get("competitors") or []:
-        goals = score_value(item.get("score"))
-        side = {
-            "id": item.get("id"),
-            "name": item.get("name"),
-            "homeAway": item.get("homeAway"),
-            "score": goals,
-            "corners": extra["corners"].get(str(item.get("id"))),
-            "line": None,
-            "result": None,
-        }
-        if item.get("homeAway") == "home":
-            home_goals = goals
-            home_name = item.get("name") or ""
-        else:
-            away_goals = goals
-            away_name = item.get("name") or ""
-        sides.append(side)
-    if extra.get("home_line") is not None and home_goals is not None and away_goals is not None:
-        for side in sides:
-            line = extra["home_line"] if side["homeAway"] == "home" else -extra["home_line"]
-            margin = (home_goals - away_goals) if side["homeAway"] == "home" else (away_goals - home_goals)
-            side["line"] = line
-            side["result"] = settle_asian(margin, line)
-    corner_values = [side["corners"] for side in sides if side.get("corners") is not None]
-    total_line = extra.get("total_line")
-    total_result = None
-    if total_line is not None and home_goals is not None and away_goals is not None:
-        total_result = settle_asian(home_goals + away_goals, -total_line)
-    return {
-        "scoreline": f"{home_name} {home_goals}-{away_goals} {away_name}",
-        "corner_total": sum(corner_values) if len(corner_values) == 2 else None,
-        "total_line": total_line,
-        "total_result": total_result,
-        "sides": sides,
-    }
 
 
-def result_counts(games: list[dict], role: str) -> tuple[list[dict], dict[str, int]]:
-    picked = []
-    for game in games:
-        line = game.get("line")
-        if line is None or not game.get("result"):
-            continue
-        if role == "giving" and line < 0:
-            picked.append(game)
-        elif role == "receiving" and line > 0:
-            picked.append(game)
-    bag: dict[str, int] = {}
-    for game in picked:
-        bag[game["result"]] = bag.get(game["result"], 0) + 1
-    return picked, bag
 
 
-def count_text(bag: dict[str, int]) -> str:
-    parts = [f"{key}{bag[key]}" for key in ("全赢", "赢半", "走水", "输半", "全输") if bag.get(key)]
-    return "，".join(parts) if parts else "没有结算"
 
 
-def team_summary(name: str, games: list[dict]) -> str:
-    giving, giving_bag = result_counts(games, "giving")
-    receiving, receiving_bag = result_counts(games, "receiving")
-    text = f"{name}：让球方{len(giving)}场，{count_text(giving_bag)}。"
-    received_wins = receiving_bag.get("全赢", 0)
-    if received_wins:
-        text += f"受让全赢{received_wins}场，不计入穿盘。"
-    return text
 
-
-def team_report(slug: str, label: str, name: str, before: datetime) -> dict:
-    team = resolve_espn_team(slug, name)
-    if team is None:
-        return {"name": name, "label": label, "games": [], "lines": [], "summary": "", "missing": f"{label}{name}：公开赛程没有对上球队"}
-    try:
-        games = recent_lines_for_team(slug, team, before)
-    except requests.RequestException as exc:
-        return {"name": name, "label": label, "games": [], "lines": [], "summary": "", "missing": f"{label}{name}：近况读取失败 {exc}"}
-    if not games:
-        return {"name": name, "label": label, "games": [], "lines": [], "summary": "", "missing": f"{label}{name}：没有读到近6场"}
-    return {
-        "name": name,
-        "label": label,
-        "games": games,
-        "lines": [game["text"] for game in games],
-        "summary": team_summary(name, games),
-        "missing": None,
-    }
-
-
-def median(values: list[float]) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    return ordered[(len(ordered) - 1) // 2]
-
-
-def scoreboard_rows(slug: str, espn_day: str) -> list[dict]:
-    def load():
-        body = espn_get(
-            f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard",
-            {"dates": espn_day.replace("-", "")},
-        )
-        rows = []
-        for event in body.get("events") or []:
-            when = kickoff_local(event["date"])
-            competition = (event.get("competitions") or [{}])[0]
-            teams = {item.get("homeAway"): item.get("team") or {} for item in competition.get("competitors") or []}
-            odds = (competition.get("odds") or [None])[0] or {}
-            rows.append({
-                "beijing_day": when.strftime("%Y-%m-%d"),
-                "home": (teams.get("home") or {}).get("displayName") or "",
-                "away": (teams.get("away") or {}).get("displayName") or "",
-                "home_line": parse_home_line(odds),
-                "total": parse_total_line(odds),
-            })
-        return rows
-
-    return cached_json(f"espn-board2-{slug}-{espn_day}.json", load, max_age_hours=6)
-
-
-def today_odds(slug: str, match: dict) -> dict:
-    kick = datetime.fromisoformat(match["sort"])
-    beijing_day = kick.astimezone(TZ).strftime("%Y-%m-%d")
-    utc_day = kick.astimezone(timezone.utc).strftime("%Y-%m-%d")
-    rows = []
-    for espn_day in dict.fromkeys((utc_day, beijing_day)):
-        try:
-            rows.extend(scoreboard_rows(slug, espn_day))
-        except requests.RequestException:
-            continue
-    best = None
-    best_score = 0
-    for row in rows:
-        if row["beijing_day"] != beijing_day:
-            continue
-        home_score = name_score(match["home"], row["home"])
-        away_score = name_score(match["away"], row["away"])
-        if home_score < 60 or away_score < 60:
-            continue
-        if home_score + away_score > best_score:
-            best_score = home_score + away_score
-            best = row
-    return best or {}
-
-
-def give_label(home_line: float, hdc: str | None, home_is_favorite: bool) -> str:
-    if hdc:
-        text = hdc.replace("+", "").replace("-", "")
-    else:
-        text = f"{abs(home_line):g}"
-    return ("主让" if home_is_favorite else "客让") + text
-
-
-def handicap_case(report: dict, line_label: str, today_abs: float, book: str = "") -> dict:
-    if report.get("missing"):
-        return {"ok": False, "reason": f"当场{line_label}，但{report['missing']}。"}
-    giving, bag = result_counts(report["games"], "giving")
-    wins = bag.get("全赢", 0)
-    losses = bag.get("全输", 0)
-    summary = report["summary"]
-    if len(giving) < 3 or not (wins > len(giving) / 2 and wins > losses):
-        return {"ok": False, "reason": f"{summary}让球方全赢没有占多数。"}
-    covered = [abs(game["line"]) for game in giving if game["result"] == "全赢"]
-    covered_mid = median(covered)
-    if covered_mid is not None and today_abs > covered_mid + 0.01:
-        return {"ok": False, "reason": f"{summary}赢过的让球中位数{covered_mid:g}，当场{line_label}更深。"}
-    confidence = "中"
-    if len(giving) >= 4 and wins / len(giving) >= 0.75 and giving[0]["result"] != "全输":
-        confidence = "高"
-    deep = [
-        f"{game['date']}让{game['line']:+g}全输"
-        for game in giving
-        if game["line"] <= -1.5 and game["result"] == "全输"
-    ]
-    risk = "盘口是马会让球。" if book == "马会" else "这是美式让分收盘，不是亚盘，下单前再对一次亚盘。"
-    if deep:
-        risk += "深盘全输：" + "、".join(deep[:3]) + "。"
-    return {
-        "ok": True,
-        "confidence": confidence,
-        "reason": f"当场{line_label}。{summary}",
-        "risk": risk,
-        "evidence": [report["summary"], *report["lines"][:4]],
-    }
-
-
-def total_case(home: dict, away: dict, today_total) -> dict:
-    if today_total is None:
-        return {"ok": False, "reason": "当场没有大小球盘，不推大球。"}
-    notes = []
-    evidence = []
-    ratios = []
-    for report in (home, away):
-        if report.get("missing"):
-            return {"ok": False, "reason": f"{report['missing']}，不推大球。"}
-        priced = [game for game in report["games"] if game.get("total_result")]
-        wins = sum(1 for game in priced if game["total_result"] == "全赢")
-        losses = sum(1 for game in priced if game["total_result"] == "全输")
-        win_lines = [game["total_line"] for game in priced if game["total_result"] == "全赢" and game.get("total_line") is not None]
-        text = f"{report['name']}大球全赢{wins}/有盘{len(priced)}"
-        notes.append(text)
-        evidence.append(text)
-        if len(priced) < 4 or not (wins > len(priced) / 2 and wins > losses):
-            return {"ok": False, "reason": f"{text}，大球全赢没有占多数。"}
-        mid = median(win_lines)
-        if mid is not None and today_total > mid + 0.01:
-            return {"ok": False, "reason": f"{report['name']}赢过的大球线中位数{mid:g}，当场{today_total:g}更高。"}
-        ratios.append(wins / len(priced))
-    confidence = "高" if ratios and min(ratios) >= 0.75 else "中"
-    return {
-        "ok": True,
-        "confidence": confidence,
-        "reason": f"当场大{today_total:g}。" + "。".join(notes) + "。",
-        "evidence": evidence,
-    }
-
-
-def corner_case(home: dict, away: dict, line) -> dict:
-    if line is None:
-        return {"ok": False, "reason": corner_note(home, away)}
-    parts = []
-    ratios = []
-    for report in (home, away):
-        if report.get("missing"):
-            return {"ok": False, "reason": f"{report['missing']}，不推大角。"}
-        totals = [game["corner_total"] for game in report.get("games") or [] if game.get("corner_total") is not None]
-        wins = sum(1 for total in totals if total > line)
-        text = f"{report['name']}全场角球大于{line:g}的有{wins}/{len(totals)}"
-        if len(totals) < 4 or wins <= len(totals) / 2:
-            return {"ok": False, "reason": f"{text}，没有占多数。"}
-        parts.append(text)
-        ratios.append(wins / len(totals))
-    confidence = "高" if ratios and min(ratios) >= 0.75 else "中"
-    return {
-        "ok": True,
-        "confidence": confidence,
-        "reason": f"当场角球大{line:g}。" + "。".join(parts) + "。",
-        "evidence": parts,
-    }
-
-
-def corner_note(home: dict, away: dict) -> str:
-    parts = []
-    for report in (home, away):
-        totals = [game["corner_total"] for game in report.get("games") or [] if game.get("corner_total") is not None]
-        if len(totals) < 4:
-            continue
-        mid = median([float(item) for item in totals])
-        parts.append(f"{report['name']}全场角球中位数{mid:g}")
-    if not parts:
-        return ""
-    return " " + "，".join(parts) + "。没有角球盘，不推大角。"
-
-
-def judge_one(match: dict) -> dict:
-    title = match_title(match)
-    home = match.get("home_report") or {"name": match["home"], "games": [], "lines": [], "summary": "", "missing": "没有近况"}
-    away = match.get("away_report") or {"name": match["away"], "games": [], "lines": [], "summary": "", "missing": "没有近况"}
-    today = match.get("today") or {}
-    home_line = today.get("home_line")
-    evidence = [item for item in (home.get("summary"), away.get("summary")) if item]
-    evidence.extend((home.get("lines") or [])[:3])
-    evidence.extend((away.get("lines") or [])[:3])
-    book = today.get("book") or ""
-    if home_line is not None and home_line < -0.01:
-        side, report, label = "主队让球", home, give_label(home_line, today.get("hdc"), True)
-    elif home_line is not None and home_line > 0.01:
-        side, report, label = "客队让球", away, give_label(home_line, today.get("hdc"), False)
-    else:
-        side, report, label = None, None, ""
-    if report is not None:
-        decision = handicap_case(report, label, abs(home_line), book)
-        if decision["ok"]:
-            opponent = away if report is home else home
-            _, received = result_counts(opponent.get("games") or [], "receiving")
-            risk = decision["risk"]
-            if received.get("全赢", 0) >= 3:
-                risk += f"对手受让全赢{received['全赢']}场。"
-            return {
-                "match": title,
-                "market": "让球",
-                "side": side,
-                "line": label,
-                "confidence": decision["confidence"],
-                "reason": decision["reason"],
-                "evidence": decision["evidence"],
-                "risk": risk,
-            }
-        handicap_reason = decision["reason"]
-    else:
-        handicap_reason = "当场没有读到让分，不判断谁是让球方。"
-    totals = total_case(home, away, today.get("total"))
-    if totals["ok"]:
-        return {
-            "match": title,
-            "market": "大球",
-            "side": "大球",
-            "line": f"{today['total']:g}",
-            "confidence": totals["confidence"],
-            "reason": totals["reason"],
-            "evidence": totals["evidence"],
-            "risk": "盘口是马会大细。" if book == "马会" else "大小球用的是美式总分收盘，下单前再对一次亚盘大小球。",
-        }
-    corners = corner_case(home, away, today.get("corner_line"))
-    if corners["ok"]:
-        return {
-            "match": title,
-            "market": "大角",
-            "side": "大角",
-            "line": f"{today['corner_line']:g}",
-            "confidence": corners["confidence"],
-            "reason": corners["reason"],
-            "evidence": corners["evidence"],
-            "risk": "盘口是马会角球大细。",
-        }
-    reason = handicap_reason + totals["reason"] + corners["reason"]
-    return {
-        "match": title,
-        "market": "跳过",
-        "side": "无",
-        "line": "无",
-        "confidence": "低",
-        "reason": reason,
-        "evidence": evidence,
-        "risk": "",
-    }
-
-
-def form_line(report: dict) -> str:
-    if report.get("missing"):
-        return report["missing"]
-    games = report.get("games") or []
-    wins = sum(1 for game in games if game.get("outcome") == "胜")
-    draws = sum(1 for game in games if game.get("outcome") == "平")
-    losses = sum(1 for game in games if game.get("outcome") == "负")
-    priced = [game for game in games if game.get("total_result")]
-    over_wins = sum(1 for game in priced if game["total_result"] == "全赢")
-    corners = [float(game["corner_total"]) for game in games if game.get("corner_total") is not None]
-    if len(corners) >= 4:
-        corner_text = f"角球中位数{median(corners):g}"
-    else:
-        corner_text = f"角球样本{len(corners)}"
-    return (
-        f"{report['name']}近{len(games)}场{wins}胜{draws}平{losses}负，"
-        f"大球全赢{over_wins}/{len(priced)}，{corner_text}"
-    )
-
-
-def outcome_case(report: dict, line_label: str, today_abs: float) -> dict:
-    if report.get("missing"):
-        return {"ok": False, "reason": f"{report['missing']}，不按胜负看让球。"}
-    games = [game for game in report.get("games") or [] if game.get("outcome") and game.get("margin") is not None]
-    covered = [
-        game for game in games
-        if game["outcome"] == "胜" and settle_asian(game["margin"], -today_abs) == "全赢"
-    ]
-    losses = sum(1 for game in games if game["outcome"] == "负")
-    wins = sum(1 for game in games if game["outcome"] == "胜")
-    summary = f"{report['name']}近{len(games)}场{wins}胜，净胜能让当天让球全赢的有{len(covered)}场"
-    if len(games) < 4 or not (len(covered) > len(games) / 2 and len(covered) > losses):
-        return {"ok": False, "reason": f"{summary}，没有占多数。"}
-    confidence = "中"
-    if len(covered) / len(games) >= 0.75 and games[0]["outcome"] != "负":
-        confidence = "高"
-    return {
-        "ok": True,
-        "confidence": confidence,
-        "reason": f"当场{line_label}。{summary}。这是按近况胜负看让球方，不是按穿盘。",
-    }
-
-
-def judge_plain(match: dict) -> dict:
-    title = match_title(match)
-    home = match.get("home_report") or {"name": match["home"], "games": [], "lines": [], "summary": "", "missing": "没有近况"}
-    away = match.get("away_report") or {"name": match["away"], "games": [], "lines": [], "summary": "", "missing": "没有近况"}
-    today = match.get("today") or {}
-    home_line = today.get("home_line")
-    book = today.get("book") or ""
-    forms = f"{form_line(home)}。{form_line(away)}。"
-    evidence = [forms]
-    evidence.extend((home.get("lines") or [])[:3])
-    evidence.extend((away.get("lines") or [])[:3])
-    totals = total_case(home, away, today.get("total"))
-    if totals["ok"]:
-        return {
-            "match": title,
-            "market": "大球",
-            "side": "大球",
-            "line": f"{today['total']:g}",
-            "confidence": totals["confidence"],
-            "reason": f"中游场。{forms}{totals['reason']}",
-            "evidence": totals["evidence"],
-            "risk": "盘口是马会大细。" if book == "马会" else "大小球用的是美式总分收盘，下单前再对一次亚盘大小球。",
-        }
-    if home_line is not None and home_line < -0.01:
-        side, report, label = "主队让球", home, give_label(home_line, today.get("hdc"), True)
-        opponent = away
-    elif home_line is not None and home_line > 0.01:
-        side, report, label = "客队让球", away, give_label(home_line, today.get("hdc"), False)
-        opponent = home
-    else:
-        side, report, label, opponent = None, None, "", None
-    if report is not None:
-        decision = outcome_case(report, label, abs(home_line))
-        if decision["ok"]:
-            risk = "盘口是马会让球。按近况胜负，不是按历史穿盘。"
-            opp_games = [game for game in (opponent or {}).get("games") or [] if game.get("outcome")]
-            opp_wins = sum(1 for game in opp_games if game["outcome"] == "胜")
-            if opp_games and opp_wins > len(opp_games) / 2:
-                risk += "对手近期胜场也过半。"
-            return {
-                "match": title,
-                "market": "让球",
-                "side": side,
-                "line": label,
-                "confidence": decision["confidence"],
-                "reason": f"中游场。{forms}{decision['reason']}",
-                "evidence": evidence,
-                "risk": risk,
-            }
-        result_reason = decision["reason"]
-    else:
-        result_reason = "当场没有让球方，胜负近况不单独开方向。"
-    corners = corner_case(home, away, today.get("corner_line"))
-    if corners["ok"]:
-        return {
-            "match": title,
-            "market": "大角",
-            "side": "大角",
-            "line": f"{today['corner_line']:g}",
-            "confidence": corners["confidence"],
-            "reason": f"中游场。{forms}{corners['reason']}",
-            "evidence": corners["evidence"],
-            "risk": "盘口是马会角球大细。",
-        }
-    return {
-        "match": title,
-        "market": "跳过",
-        "side": "无",
-        "line": "无",
-        "confidence": "低",
-        "reason": forms + totals["reason"] + result_reason + corners["reason"],
-        "evidence": evidence,
-        "risk": "",
-    }
-
-
-def analyze_plain(matches: list[dict]) -> dict:
-    return {"picks": [judge_plain(match) for match in matches]}
-
-
-def name_is(name: str, key: str) -> bool:
-    folded = fold_name(name)
-    if folded == key or folded.startswith(key + " "):
-        return True
-    if " " not in key and folded.endswith(" " + key):
-        return True
-    return False
-
-
-def strong_tag(name: str) -> str:
-    for key, tag in STRONG_CLUBS:
-        if name_is(name, key):
-            return tag
-    return ""
 
 
 def quarter_label(value: float) -> str:
@@ -2023,20 +757,6 @@ def quarter_label(value: float) -> str:
         right = (quarters + 1) / 4
         return f"{left:g}/{right:g}"
     return f"{quarters / 4:g}"
-
-
-def extra_slugs(league_en: str, name: str) -> list[str]:
-    slugs = []
-    tag = strong_tag(name)
-    if tag.startswith("沙特"):
-        slugs.append("ksa.1")
-    if tag.startswith("葡超") or league_en == "Primeira Liga":
-        slugs.extend(["por.1", "uefa.europa", "uefa.champions"])
-    if tag.startswith("法甲") or league_en == "Ligue 1":
-        slugs.extend(["fra.1", "uefa.champions", "uefa.europa"])
-    if league_en == "Superliga":
-        slugs.extend(["uefa.champions", "uefa.europa"])
-    return slugs
 
 
 def goal_number(raw) -> int | None:
@@ -2114,6 +834,18 @@ def recent_goal_games(slug: str, team: dict, before: datetime) -> list[dict]:
     return games
 
 
+def extra_slugs(league_en: str, name: str = "") -> list[str]:
+    """国内杯赛/欧战的近况也算进球样本，联赛本身由调用方传入。"""
+    slugs = []
+    if league_en == "Primeira Liga":
+        slugs.extend(["por.1", "uefa.europa", "uefa.champions"])
+    if league_en == "Ligue 1":
+        slugs.extend(["fra.1", "uefa.champions", "uefa.europa"])
+    if league_en == "Superliga":
+        slugs.extend(["uefa.champions", "uefa.europa"])
+    return slugs
+
+
 def team_goal_profile(slug: str, name: str, before: datetime, league_en: str) -> dict:
     slugs = []
     for item in [slug, *extra_slugs(league_en, name)]:
@@ -2140,246 +872,16 @@ def team_goal_profile(slug: str, name: str, before: datetime, league_en: str) ->
     games.sort(key=lambda item: item["sort"], reverse=True)
     return {
         "name": name,
-        "tag": strong_tag(name),
         "games": games,
         "same": [game for game in games if game["same"]],
         "missing": None if matched else f"{name}没有对上公开赛程",
     }
 
 
-def focus_handicap(match: dict, home: dict, away: dict, home_line: float) -> dict | None:
-    favorite_home = home_line < -0.01
-    favorite = home if favorite_home else away
-    opponent = away if favorite_home else home
-    if name_is(favorite["name"], "paris saint germain") and match.get("league_en") == "Ligue 1":
-        return None
-    depth = abs(home_line)
-    place = "主队" if favorite_home else "客队"
-    label = ("主让" if favorite_home else "客让") + quarter_label(depth)
-    tag = favorite["tag"]
-    recent = favorite["games"][:6]
-    same = favorite["same"]
-    opp_same = opponent["same"]
-    cn = match["home_ch"] if favorite_home else match["away_ch"]
-    opp_cn = match["away_ch"] if favorite_home else match["home_ch"]
-
-    if len(recent) >= 5 and all(game["outcome"] != "负" for game in recent) and depth <= 0.5 + 0.01:
-        return {
-            "side": place + "不败",
-            "line": ("主" if favorite_home else "客") + "勝或和",
-            "reason": f"{cn}近{len(recent)}场没有输球，主客和盘支持{place}不败。",
-            "evidence": [f"{game['date']} {game['goals_for']}-{game['goals_against']} {game['opponent']}" for game in recent[:4]],
-        }
-    if tag and 1.5 - 0.01 <= depth <= 2.0 + 0.01 and len(opp_same) >= 2 and all(game["outcome"] != "胜" for game in opp_same):
-        return {
-            "side": place + "让球",
-            "line": label,
-            "reason": f"{opp_cn}本届{len(opp_same)}场没有赢，{cn}是{tag}。可以看{label}穿盘。",
-            "evidence": [f"{game['date']} {game['goals_for']}-{game['goals_against']} {game['opponent']}" for game in opp_same[:4]],
-        }
-    wins = [game for game in recent if game["outcome"] == "胜"]
-    losses = sum(1 for game in recent if game["outcome"] == "负")
-    win_mid = median([float(game["margin"]) for game in wins])
-    if (
-        len(recent) >= 5
-        and len(wins) >= 4
-        and losses <= 2
-        and win_mid is not None
-        and win_mid >= 2 - 0.01
-        and 1.0 - 0.01 <= depth <= min(1.5, win_mid) + 0.01
-    ):
-        return {
-            "side": place + "让球",
-            "line": label,
-            "reason": f"{cn}近{len(recent)}场{len(wins)}胜，赢球净胜中位数{win_mid:g}。可以看{label}。",
-            "evidence": [f"{game['date']} {game['goals_for']}-{game['goals_against']} {game['opponent']}" for game in recent[:4]],
-        }
-    if tag and len(same) >= 2 and all(game["outcome"] == "胜" for game in same):
-        margins = [float(game["margin"]) for game in same]
-        mid = median(margins)
-        if mid is not None and depth <= mid + 0.01 and depth <= 1.5 + 0.01:
-            return {
-                "side": place + "让球",
-                "line": label,
-                "reason": f"{cn}是{tag}，本届{len(same)}场都赢，净胜中位数{mid:g}。可以看{label}。",
-                "evidence": [f"{game['date']} {game['goals_for']}-{game['goals_against']} {game['opponent']}" for game in same[:4]],
-            }
-    scored = sum(1 for game in recent if game["goals_for"] >= 1)
-    opponent_scores = any(game["goals_for"] > 0 for game in opp_same)
-    opponent_concedes = any(game["goals_against"] > 0 for game in opp_same)
-    if (
-        tag
-        and 0.5 - 0.01 <= depth <= 1.0 + 0.01
-        and len(recent) >= 4
-        and scored >= 4
-        and opponent_scores
-        and opponent_concedes
-    ):
-        return {
-            "side": place + "让球",
-            "line": label,
-            "reason": f"{cn}是{tag}，近况有进球。{opp_cn}本届能进球也能丢球。看好{place}拿下，{label}。",
-            "evidence": [f"{game['date']} {game['goals_for']}-{game['goals_against']} {game['opponent']}" for game in recent[:4]],
-        }
-    return None
 
 
-def average_total(games: list[dict]) -> float | None:
-    sample = games[:6]
-    if len(sample) < 4:
-        return None
-    return sum(game["total"] for game in sample) / len(sample)
 
 
-def hkjc_line_text(raw: str | None, number: float) -> str:
-    if raw:
-        return str(raw).replace("+", "").replace("-", "")
-    return quarter_label(number)
-
-
-def over_view(games: list[dict], today_total: float, today_text: str | None, reason: str) -> dict:
-    return {
-        "line": hkjc_line_text(today_text, today_total),
-        "reason": reason,
-        "risk": "盘口是马会大细。",
-        "evidence": [f"{game['date']} 总进球{game['total']} {game['opponent']}" for game in games[:4]],
-    }
-
-
-def judge_focus(match: dict) -> list[dict]:
-    title = f"{match['kickoff']} {match_title(match)}"
-    before = datetime.fromisoformat(match["sort"])
-    slug = espn_slug_for(match["country"], match.get("league_en") or "")
-    empty = {"name": "", "tag": "", "games": [], "same": [], "missing": "没有公开赛程"}
-    if slug is None:
-        home, away = empty, empty
-    else:
-        home = team_goal_profile(slug, match["home"], before, match.get("league_en") or "")
-        away = team_goal_profile(slug, match["away"], before, match.get("league_en") or "")
-    match["home_report"] = home
-    match["away_report"] = away
-    today = match.get("hkjc") or {}
-    home_line = today.get("home_line")
-    picks = []
-    handicap = None
-    if home_line is not None and abs(home_line) > 0.01 and slug is not None:
-        handicap = focus_handicap(match, home, away, home_line)
-    if handicap:
-        picks.append({
-            "match": title,
-            "market": "让球",
-            "side": handicap["side"],
-            "line": handicap["line"],
-            "confidence": "中",
-            "reason": handicap["reason"],
-            "evidence": handicap["evidence"],
-            "risk": "盘口是马会让球。",
-        })
-    favorite = None
-    if home_line is not None and home_line < -0.01:
-        favorite = home
-    elif home_line is not None and home_line > 0.01:
-        favorite = away
-    elif home["tag"] and not away["tag"]:
-        favorite = home
-    elif away["tag"] and not home["tag"]:
-        favorite = away
-    over = None
-    today_total = today.get("total")
-    today_text = today.get("total_text")
-    shown = hkjc_line_text(today_text, today_total) if today_total is not None else ""
-    if today_total is not None and handicap and favorite and favorite["tag"] and 0 < len(favorite["same"]) < 4:
-        sample = favorite["same"][:6]
-        if all(game["total"] > today_total + 0.01 for game in sample):
-            over = over_view(
-                sample,
-                today_total,
-                today_text,
-                f"近{len(sample)}场总进球都大于{shown}。可以看大{shown}。",
-            )
-    elif today_total is not None and not handicap:
-        home_avg = average_total(home["games"])
-        away_avg = average_total(away["games"])
-        if home_avg is not None and away_avg is not None and min(home_avg, away_avg) + 0.01 >= today_total:
-            over = over_view(
-                (favorite or home)["games"],
-                today_total,
-                today_text,
-                f"两队近况场均总进球{home_avg:.1f}和{away_avg:.1f}。可以看大{shown}。",
-            )
-    if over:
-        reason = over["reason"]
-        if match.get("league_en") == "Ligue 1" and (
-            name_is(match["home"], "paris saint germain") or name_is(match["away"], "paris saint germain")
-        ):
-            reason = "联赛和欧冠不是一套阵容，胜负不稳定，不看让球。" + reason
-        picks.append({
-            "match": title,
-            "market": "大球",
-            "side": "大球",
-            "line": over["line"],
-            "confidence": "中",
-            "reason": reason,
-            "evidence": over["evidence"],
-            "risk": over["risk"],
-        })
-    if picks:
-        return picks
-    if name_is(match["home"], "paris saint germain") or name_is(match["away"], "paris saint germain"):
-        note = "联赛和欧冠不是一套阵容，胜负不稳定，不看让球。"
-    elif home.get("missing") or away.get("missing"):
-        note = (home.get("missing") or "") + (away.get("missing") or "")
-    else:
-        note = "强队身份、进球和近况没有同时成立。"
-    return [{
-        "match": title,
-        "market": "跳过",
-        "side": "无",
-        "line": "无",
-        "confidence": "低",
-        "reason": note,
-        "evidence": [],
-        "risk": "",
-    }]
-
-
-def gather_context(matches: list[dict]) -> None:
-    for match in matches:
-        slug = espn_slug_for(match["country"], match.get("league_en") or match["league"])
-        before = datetime.fromisoformat(match["sort"])
-        hkjc = match.get("hkjc") or {}
-        if slug is None:
-            empty = {"games": [], "lines": [], "summary": "", "missing": "这个联赛没有公开近况"}
-            match["home_report"] = {**empty, "name": match["home"], "label": "主队"}
-            match["away_report"] = {**empty, "name": match["away"], "label": "客队"}
-            today = {}
-        else:
-            match["home_report"] = team_report(slug, "主队", match["home"], before)
-            match["away_report"] = team_report(slug, "客队", match["away"], before)
-            need_espn = hkjc.get("home_line") is None or hkjc.get("total") is None
-            today = today_odds(slug, match) if need_espn else {}
-        if hkjc.get("home_line") is not None:
-            today["home_line"] = hkjc["home_line"]
-            today["hdc"] = hkjc.get("hdc")
-            today["book"] = "马会"
-        if hkjc.get("total") is not None:
-            today["total"] = hkjc["total"]
-            today["book"] = "马会"
-        if hkjc.get("corner_line") is not None:
-            today["corner_line"] = hkjc["corner_line"]
-        match["today"] = today
-        recent = []
-        for report in (match["home_report"], match["away_report"]):
-            if report.get("missing"):
-                recent.append(report["missing"])
-            elif report.get("summary"):
-                recent.append(report["summary"])
-                recent.extend(report["lines"])
-        match["recent"] = recent
-
-
-def analyze(matches: list[dict]) -> dict:
-    return {"picks": [judge_one(match) for match in matches]}
 
 
 def parse_json(content: str) -> dict:
@@ -2387,7 +889,20 @@ def parse_json(content: str) -> dict:
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?", "", text).strip()
         text = re.sub(r"```$", "", text).strip()
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # 模型偶尔把 JSON 截断，尽量抢救出完整的部分，不要让整封邮件失败。
+        cut = text.rfind("}")
+        while cut > 0:
+            attempt = text[:cut + 1]
+            for suffix in ("", "]}", "}]}", "]}", "}"):
+                try:
+                    return json.loads(attempt + suffix)
+                except json.JSONDecodeError:
+                    continue
+            cut = text.rfind("}", 0, cut)
+        raise
 
 
 def llm(messages: list[dict]) -> dict:
@@ -2396,6 +911,7 @@ def llm(messages: list[dict]) -> dict:
     payload = {
         "model": LLM_MODEL,
         "temperature": 0.2,
+        "max_tokens": 4096,
         "messages": messages,
         "response_format": {"type": "json_object"},
     }
@@ -2406,6 +922,311 @@ def llm(messages: list[dict]) -> dict:
     resp.raise_for_status()
     content = resp.json()["choices"][0]["message"]["content"]
     return parse_json(content)
+
+
+# ---------------------------------------------------------------------------
+# 概率层
+#
+# 这里不再有「让球方一定赢」「强队一定打穿」这类人为规则。
+# 每个可下注方向都只有一个来源：由市场盘口反推的进球分布（可选叠加近况），
+# 然后算命中率 win、走水 push 和期望 edge。
+# 公式：概率 = P(净胜球跨过盘口)，期望 = win×(赔率-1) − (1 − win − push)。
+# ---------------------------------------------------------------------------
+
+SCREEN_MIN_ODDS = float(os.environ.get("SCREEN_MIN_ODDS", "1.25"))
+SCREEN_MIN_PROB = float(os.environ.get("SCREEN_MIN_PROB", "0.55"))
+SCREEN_POOL = int(os.environ.get("SCREEN_POOL", "6"))
+SHOW_LIMIT = int(os.environ.get("SHOW_LIMIT", "12"))
+
+
+def card_matches(day: str, notes: list[str]) -> list[dict]:
+    """窗口内所有未开赛的马会比赛，只做盘口整理，不做取舍。"""
+    start, end = slate_window(day)
+    now = datetime.now(TZ)
+    try:
+        card = hkjc_card()
+    except Exception as exc:  # 取不到盘口就让上游给出空结果，别整封邮件消失
+        notes.append(f"马会盘口没取到：{exc}")
+        return []
+    out = []
+    for item in card:
+        if not item.get("kickoff") or item.get("status") != "PREEVENT":
+            continue
+        try:
+            when = kickoff_local(item["kickoff"])
+        except ValueError:
+            continue
+        if not (start <= when < end) or when < now:
+            continue
+        if is_friendly(item["tournament_en"]) or is_women_or_youth(item["home"]) or is_women_or_youth(item["away"]):
+            continue
+        country, league = HKJC_LEAGUES.get(item["tournament_en"], ("", item["tournament_en"]))
+        out.append({
+            "no": item["no"],
+            "when": when,
+            "kickoff": when.strftime("%m-%d %H:%M"),
+            "league": league,
+            "league_en": league,
+            "tournament": item["tournament_en"],
+            "country": country,
+            "home": item["home"],
+            "away": item["away"],
+            "home_ch": item["home_ch"],
+            "away_ch": item["away_ch"],
+            "card": item,
+            "home_report": None,
+            "away_report": None,
+        })
+    out.sort(key=lambda match: match["when"])
+    return out
+
+
+def goal_distribution(lam: tuple[float, float] | None):
+    """(主队期望进球, 客队期望进球) -> (净胜球分布, 总进球分布)。"""
+    if not lam or lam[0] <= 0 or lam[1] <= 0:
+        return None, None
+    home = poisson_pmf(lam[0])
+    away = poisson_pmf(lam[1])
+    margins: dict[int, float] = {}
+    totals: dict[int, float] = {}
+    for home_goals, home_prob in enumerate(home):
+        if home_prob < 1e-12:
+            continue
+        for away_goals, away_prob in enumerate(away):
+            prob = home_prob * away_prob
+            if prob < 1e-12:
+                continue
+            margins[home_goals - away_goals] = margins.get(home_goals - away_goals, 0.0) + prob
+            totals[home_goals + away_goals] = totals.get(home_goals + away_goals, 0.0) + prob
+    return margins, totals
+
+
+def corner_distribution(home_report: dict | None, away_report: dict | None) -> dict[int, float] | None:
+    if not home_report or not away_report:
+        return None
+    lam = corner_lambda(home_report, away_report)
+    if not lam or lam <= 0:
+        return None
+    return {index: prob for index, prob in enumerate(poisson_pmf(lam))}
+
+
+def flip(dist: dict[int, float]) -> dict[int, float]:
+    """换一个方向看同一个分布（客队视角、小球视角）。"""
+    return {-key: value for key, value in dist.items()}
+
+
+def asian_view(dist: dict[int, float], line: float) -> tuple[float, float]:
+    """dist 是押注方视角的净胜球（或总进球）分布，line 是让出的球，负数为让。
+
+    和 settle_asian 用同一个式子：value + line 与 0 比较，所以门槛是 -line。
+    """
+    if not dist:
+        return 0.0, 0.0
+    parts = split_outcome(line)
+    share = 1.0 / len(parts)
+    win = push = 0.0
+    for value, prob in dist.items():
+        for part in parts:
+            threshold = -part
+            if value > threshold + 1e-9:
+                win += prob * share
+            elif abs(value - threshold) <= 1e-9:
+                push += prob * share
+    return win, push
+
+
+def match_meta(match: dict) -> dict:
+    return {
+        "no": match["no"],
+        "kickoff": match["when"].isoformat(timespec="seconds"),
+        "league": match["league"],
+        "league_en": match["league_en"],
+        "country": match["country"],
+        "home": match["home"],
+        "away": match["away"],
+    }
+
+
+def quote(match: dict, market: str, side: str, line_text: str, win: float, push: float,
+          odds: float, meta: dict) -> dict:
+    return {
+        "match": f"{match['kickoff']} {match['home_ch']} vs {match['away_ch']}",
+        "market": market,
+        "side": side,
+        "line": line_text,
+        "odds": odds,
+        "prob": round(win, 4),
+        "push": round(push, 4),
+        "edge": round(asian_ev(win, push, odds), 4),
+        "meta": meta,
+    }
+
+
+def market_quotes(match: dict, lam: tuple[float, float] | None) -> list[dict]:
+    """一场比赛里马会开出的每个方向，全部按分布算成候选。"""
+    card = match["card"]
+    prices = card.get("prices") or {}
+    margins, totals = goal_distribution(lam)
+    if not margins:
+        return []
+    corners = corner_distribution(match.get("home_report"), match.get("away_report"))
+    out = []
+
+    home_line = card.get("home_line")
+    if home_line is not None and abs(home_line) > 1e-6:
+        depth = abs(home_line)
+        favorite_home = home_line < 0
+        for row in prices.get("HDC") or []:
+            odds = row.get("odds")
+            if not odds or odds < SCREEN_MIN_ODDS:
+                continue
+            back = "home" if row.get("str") == "H" else "away"
+            favorite = (back == "home") == favorite_home
+            dist = margins if back == "home" else flip(margins)
+            win, push = asian_view(dist, -depth if favorite else depth)
+            label = quarter_label(depth)
+            meta = match_meta(match)
+            meta.update({
+                "kind": "handicap",
+                "back": back,
+                "depth": depth,
+                "is_favorite": favorite,
+                "favorite": "home" if favorite_home else "away",
+            })
+            side = f"{'主队' if back == 'home' else '客队'}{'让' if favorite else '受让'}{label}"
+            out.append(quote(match, "让球", side, label, win, push, odds, meta))
+
+    total_line = card.get("total")
+    if total_line:
+        for row in prices.get("HIL") or []:
+            odds = row.get("odds")
+            if not odds or odds < SCREEN_MIN_ODDS:
+                continue
+            over = row.get("str") == "H"
+            win, push = asian_view(totals if over else flip(totals),
+                                   -total_line if over else total_line)
+            meta = match_meta(match)
+            meta.update({"kind": "total", "direction": "over" if over else "under",
+                         "total_value": total_line, "line_value": total_line})
+            label = f"{total_line:g}"
+            out.append(quote(match, "大球" if over else "小球", "大球" if over else "小球",
+                             label, win, push, odds, meta))
+
+    corner_line = card.get("corner_line")
+    if corner_line and corners:
+        for row in prices.get("CHL") or []:
+            odds = row.get("odds")
+            if not odds or odds < SCREEN_MIN_ODDS:
+                continue
+            over = row.get("str") == "H"
+            win, push = asian_view(corners if over else flip(corners),
+                                   -corner_line if over else corner_line)
+            meta = match_meta(match)
+            meta.update({"kind": "corner", "direction": "over" if over else "under",
+                         "corner_value": corner_line, "line_value": corner_line})
+            label = f"{corner_line:g}"
+            out.append(quote(match, "大角" if over else "小角", "大角" if over else "小角",
+                             label, win, push, odds, meta))
+    return out
+
+
+def team_reports(match: dict) -> tuple[dict, dict] | None:
+    slug = espn_slug_for(match["country"], match["league_en"])
+    if not slug:
+        return None
+    try:
+        home = team_goal_profile(slug, match["home"], match["when"], match["league_en"])
+        away = team_goal_profile(slug, match["away"], match["when"], match["league_en"])
+    except requests.RequestException:
+        return None
+    if home.get("missing") or away.get("missing"):
+        return None
+    match["home_report"] = home
+    match["away_report"] = away
+    return home, away
+
+
+def form_note(market_lam, form_lam, blend) -> str:
+    bits = [f"市场期望进球 {market_lam[0]:.2f}-{market_lam[1]:.2f}"]
+    if form_lam:
+        bits.append(f"近况 {form_lam[0]:.2f}-{form_lam[1]:.2f}")
+    bits.append(f"融合 {blend[0]:.2f}-{blend[1]:.2f}")
+    return "，".join(bits)
+
+
+def screen(day: str, notes: list[str]) -> list[dict]:
+    """全盘口扫描：先按纯市场分布排，再给概率最高的几场补近况重算。"""
+    matches = card_matches(day, notes)
+    if not matches:
+        notes.append("窗口内没有可分析的比赛。")
+        return []
+    quotes: list[dict] = []
+    no_market = []
+    for match in matches:
+        lam = market_lambdas(match["card"])
+        if not lam:
+            no_market.append(match)
+            continue
+        match["lam_market"] = lam
+        for pick in market_quotes(match, lam):
+            pick["prob_market"] = pick["prob"]
+            quotes.append(pick)
+
+    notes.append(
+        f"窗口内 {len(matches)} 场：{len(matches) - len(no_market)} 场能反推期望进球，"
+        f"摊平出 {len(quotes)} 个可下方向。"
+    )
+    if no_market:
+        names = "、".join(f"{item['home_ch']}vs{item['away_ch']}" for item in no_market[:3])
+        notes.append(f"{len(no_market)} 场没有总入球盘/HAD，算不出分布，已跳过：{names}。")
+
+    by_match: dict[str, list[dict]] = {}
+    for pick in quotes:
+        by_match.setdefault(pick["meta"]["no"], []).append(pick)
+    order = sorted(
+        (match for match in matches if match["no"] in by_match),
+        key=lambda match: max(pick["prob"] for pick in by_match[match["no"]]),
+        reverse=True,
+    )
+    for match in order[:SCREEN_POOL]:
+        reports = team_reports(match)
+        if not reports:
+            continue
+        blend = blended_lambdas(match["card"], reports[0], reports[1])
+        form_lam = goal_expectation(reports[0], reports[1])
+        if not blend:
+            continue
+        note = form_note(match["lam_market"], form_lam, blend)
+        fresh = {(pick["market"], pick["side"], pick["line"]): pick
+                 for pick in market_quotes(match, blend)}
+        form_prob = {(pick["market"], pick["side"], pick["line"]): pick["prob"]
+                     for pick in market_quotes(match, form_lam)} if form_lam else {}
+        for index, old in enumerate(by_match[match["no"]]):
+            key = (old["market"], old["side"], old["line"])
+            new = fresh.get(key)
+            if new is None:
+                continue
+            new["prob_market"] = old["prob"]
+            new["prob_form"] = form_prob.get(key)
+            new["reason"] = note
+            by_match[match["no"]][index] = new
+
+    pool = [pick for picks in by_match.values() for pick in picks]
+    for pick in pool:
+        if not pick.get("reason"):
+            match = next((item for item in matches if item["no"] == pick["meta"]["no"]), None)
+            lam = (match or {}).get("lam_market")
+            pick["reason"] = form_note(lam, None, lam) if lam else ""
+    pool.sort(key=lambda pick: (pick["prob"], pick["edge"]), reverse=True)
+    return pool
+
+
+def ranked_all(picks: list[dict], stats: dict | None = None) -> list[dict]:
+    return sorted(picks, key=lambda pick: ((pick.get("prob") or 0), (pick.get("edge") or 0)), reverse=True)
+
+
+def rule_top3(picks: list[dict], stats: dict | None = None) -> list[dict]:
+    return distinct_matches(ranked_all(picks), 3)
 
 
 HISTORY_FILE = ROOT / "picks-history.jsonl"
@@ -2436,61 +1257,6 @@ def save_history(rows: list[dict]) -> None:
     HISTORY_FILE.write_text(text + ("\n" if text else ""), encoding="utf-8")
 
 
-def attach_meta(picks: list[dict], matches: list[dict]) -> None:
-    by_title = {match_title(match): match for match in matches}
-    for pick in picks:
-        label = pick.get("match") or ""
-        match = next((item for title, item in by_title.items() if title and title in label), None)
-        if match is None:
-            continue
-        today = match.get("hkjc") or {}
-        home_line = today.get("home_line")
-        if home_line is None:
-            favorite = None
-            depth = None
-        elif home_line < -0.01:
-            favorite = "home"
-            depth = abs(home_line)
-        elif home_line > 0.01:
-            favorite = "away"
-            depth = abs(home_line)
-        else:
-            favorite = None
-            depth = None
-        pick["meta"] = {
-            "no": match.get("hkjc_no"),
-            "kickoff": match.get("sort"),
-            "league": match.get("league"),
-            "league_en": match.get("league_en"),
-            "country": match.get("country"),
-            "home": match.get("home"),
-            "away": match.get("away"),
-            "depth": depth,
-            "favorite": favorite,
-            "total_value": today.get("total"),
-            "corner_value": today.get("corner_line"),
-            "kind": "double_chance" if "不败" in str(pick.get("side") or "") else pick.get("market"),
-            "scope": ("home" if "主队" in str(pick.get("side") or "") else "away")
-            if "不败" in str(pick.get("side") or "") else None,
-        }
-        home_report = match.get("home_report") or {}
-        away_report = match.get("away_report") or {}
-        views = market_view(today, home_report, away_report)
-        lam = views["blended"]
-        pick["meta"]["corner_lam"] = corner_lambda(home_report, away_report)
-        pick["meta"]["lambda"] = lam
-        pick["meta"]["lambda_market"] = views["market"]
-        pick["meta"]["lambda_form"] = views["form"]
-        odds = odds_for(today, pick.get("market"), pick.get("side"))
-        view = pick_probability(pick, pick["meta"], lam, odds)
-        pick.update(view)
-        # 同时存下市场口径和近况口径，之后用 Brier 分数判断哪个更准。
-        for key in ("market", "form"):
-            alt = pick_probability(pick, pick["meta"], views[key], odds)
-            pick[f"prob_{key}"] = alt.get("prob")
-            pick[f"edge_{key}"] = alt.get("edge")
-
-
 def history_row(day: str, pick: dict, kind: str) -> dict | None:
     meta = pick.get("meta")
     if not meta or not meta.get("no"):
@@ -2509,6 +1275,10 @@ def history_row(day: str, pick: dict, kind: str) -> dict | None:
         "line": pick.get("line"),
         "depth": meta.get("depth"),
         "favorite": meta.get("favorite"),
+        "back": meta.get("back"),
+        "is_favorite": meta.get("is_favorite"),
+        "direction": meta.get("direction"),
+        "line_value": meta.get("line_value"),
         "total_value": meta.get("total_value"),
         "corner_value": meta.get("corner_value"),
         "kind": kind,
@@ -2532,7 +1302,8 @@ def history_row(day: str, pick: dict, kind: str) -> dict | None:
 
 REFRESH_FIELDS = ("kind", "scope", "model", "odds", "prob", "edge", "prob_market", "prob_form",
                   "confidence", "reason",
-                  "depth", "favorite", "total_value", "corner_value", "league", "league_en", "country")
+                  "depth", "favorite", "back", "is_favorite", "direction", "line_value",
+                  "total_value", "corner_value", "league", "league_en", "country")
 
 
 def record_history(day: str, picks: list[dict]) -> tuple[int, int]:
@@ -2570,59 +1341,6 @@ def record_history(day: str, picks: list[dict]) -> tuple[int, int]:
     return added, refreshed
 
 
-def record_observations(day: str, matches: list[dict], picked: list[dict]) -> int:
-    """把跳过的场次也记下来，之后才能检验过滤规则本身准不准。"""
-    rows = load_history()
-    seen = {(row.get("run_day"), row.get("no"), row.get("kind")) for row in rows}
-    picked_nos = {(pick.get("meta") or {}).get("no") for pick in picked}
-    added = 0
-    for match in matches:
-        no = match.get("hkjc_no")
-        if not no or no in picked_nos or (day, no, "observe") in seen:
-            continue
-        today = match.get("hkjc") or {}
-        home_line = today.get("home_line")
-        if home_line is None or abs(home_line) < 0.01:
-            favorite, depth = None, None
-        else:
-            favorite = "home" if home_line < 0 else "away"
-            depth = abs(home_line)
-        seen.add((day, no, "observe"))
-        rows.append({
-            "run_day": day,
-            "no": no,
-            "kickoff": match.get("sort"),
-            "league": match.get("league"),
-            "league_en": match.get("league_en"),
-            "country": match.get("country"),
-            "home": match.get("home"),
-            "away": match.get("away"),
-            "market": "观察",
-            "side": "跳过",
-            "line": today.get("hdc") or "",
-            "depth": depth,
-            "favorite": favorite,
-            "total_value": today.get("total"),
-            "corner_value": today.get("corner_line"),
-            "kind": "observe",
-            "confidence": None,
-            "odds": None,
-            "prob": None,
-            "edge": None,
-            "reason": "被规则跳过，用赛果检验过滤是否有效。",
-            "settlement": None,
-            "home_goals": None,
-            "away_goals": None,
-            "corner_total": None,
-            "settled_day": None,
-            "settle_attempts": 0,
-        })
-        added += 1
-    if added:
-        save_history(rows)
-    return added
-
-
 def espn_day_results(slug: str, day: str) -> list[dict]:
     def load():
         body = espn_get(
@@ -2653,6 +1371,11 @@ def espn_day_results(slug: str, day: str) -> list[dict]:
 
 def find_result(row: dict) -> dict | None:
     slug = espn_slug_for(row.get("country") or "", row.get("league_en") or "")
+    if slug is None:
+        # 老记录里存的是马会原始赛事名，反查一次映射表。
+        mapped = HKJC_LEAGUES.get(row.get("league_en") or "")
+        if mapped:
+            slug = espn_slug_for(mapped[0], mapped[1])
     if slug is None or not row.get("kickoff"):
         return None
     kick = datetime.fromisoformat(row["kickoff"])
@@ -2721,29 +1444,38 @@ def settle_row(row: dict, result: dict, corners: dict) -> str | None:
         if scope == "away":
             return "全赢" if away_goals >= home_goals else "全输"
         return None
-    market = row.get("market")
+    market = row.get("market") or ""
     if market == "让球":
         depth = row.get("depth")
         if depth is None:
             return None
-        if row.get("favorite") == "home":
-            margin = home_goals - away_goals
-        elif row.get("favorite") == "away":
-            margin = away_goals - home_goals
-        else:
-            return None
-        return settle_asian(margin, -float(depth))
-    if market == "大球":
+        back = row.get("back")
+        if back not in ("home", "away"):
+            favorite = row.get("favorite")
+            if favorite not in ("home", "away"):
+                return None
+            back = favorite
+        is_favorite = row.get("is_favorite")
+        if is_favorite is None:
+            is_favorite = back == row.get("favorite")
+        margin = (home_goals - away_goals) if back == "home" else (away_goals - home_goals)
+        # 受让方向就是把盘口翻到另一边，统一成一个公式。
+        return settle_asian(margin, -float(depth) if is_favorite else float(depth))
+    if market in ("大球", "小球"):
         line = row.get("total_value")
         if line is None:
             return None
-        return settle_asian(home_goals + away_goals, -float(line))
-    if market == "大角":
+        total = home_goals + away_goals
+        under = market == "小球" or row.get("direction") == "under"
+        return settle_asian(-total if under else total, line if under else -float(line))
+    if market in ("大角", "小角"):
         line = row.get("corner_value")
         values = [int(value) for value in (corners or {}).values()]
         if line is None or len(values) != 2:
             return None
-        return settle_asian(sum(values), -float(line))
+        total = sum(values)
+        under = market == "小角" or row.get("direction") == "under"
+        return settle_asian(-total if under else total, line if under else -float(line))
     return None
 
 
@@ -2772,7 +1504,7 @@ def settle_history(rows: list[dict], day: str) -> tuple[int, int]:
             pending += 1
             continue
         corners = {}
-        need_corners = row.get("market") == "大角" or (
+        need_corners = row.get("market") in ("大角", "小角") or (
             row.get("kind") == "observe" and row.get("corner_value") is not None and corner_budget > 0
         )
         if need_corners:
@@ -2858,46 +1590,12 @@ def calibration_report(day: str, rows: list[dict]) -> list[str]:
     return lines
 
 
-def observed_review(day: str, rows: list[dict]) -> list[str]:
-    """被跳过的场次打出来了什么，用来验证过滤规则是不是筛过头。"""
-    horizon = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=TZ) - timedelta(days=REVIEW_DAYS)
-    observed = [
-        row for row in rows
-        if row.get("kind") == "observe" and row.get("home_goals") is not None
-        and row.get("kickoff") and parse_kickoff(row["kickoff"]) >= horizon
-    ]
-    if not observed:
-        return []
-    charged = [row for row in rows if row.get("settlement") and row.get("kind") != "observe" and row.get("home_goals") is not None]
-    over_hit = 0
-    priced = 0
-    for row in observed:
-        line = row.get("total_value")
-        if line is None:
-            continue
-        priced += 1
-        if row["home_goals"] + row["away_goals"] > float(line) + 0.01:
-            over_hit += 1
-    lines = []
-    if priced:
-        lines.append(f"被跳过的 {len(observed)} 场里，有 {over_hit}/{priced} 场大球其实打出（按当场盘口）。")
-    else:
-        lines.append(f"被跳过的 {len(observed)} 场已结算，但这批没有可对照的大小球盘。")
-    if charged:
-        picked_avg = sum(row["home_goals"] + row["away_goals"] for row in charged) / len(charged)
-        skip_avg = sum(row["home_goals"] + row["away_goals"] for row in observed) / len(observed)
-        lines.append(f"推荐场次场均总进球 {picked_avg:.2f}，跳过场次 {skip_avg:.2f}。")
-        if skip_avg > picked_avg + 0.3:
-            lines.append("跳过场次的进球反而更多，说明大球过滤可能筛过头了。")
-    return lines
-
-
 def tab_text(row: dict) -> str:
     score = ""
     if row.get("home_goals") is not None:
         score = f"{row['home_goals']}-{row['away_goals']}"
     corner = ""
-    if row.get("market") == "大角" and row.get("corner_total") is not None:
+    if row.get("market") in ("大角", "小角") and row.get("corner_total") is not None:
         corner = f" 角球{row['corner_total']}"
     date = (row.get("kickoff") or "")[5:10]
     return (
@@ -2915,7 +1613,7 @@ def review_lines(day: str, recent: list[dict], stats: dict[str, dict[str, int]],
     horizon = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=TZ) - timedelta(days=REVIEW_DAYS)
     label = f"{horizon:%m-%d} 至 {day[5:]}"
     if not recent:
-        lines = [f"过去 {REVIEW_DAYS} 天（{label}）没有已结算的推荐，今天先按规则排。"]
+        lines = [f"过去 {REVIEW_DAYS} 天（{label}）没有已结算的推荐，今天只按模型命中率排。"]
         if pending:
             lines.append(f"- 另有 {pending} 场还没对上 ESPN 赛果，复盘样本偏少。")
         return lines
@@ -2960,21 +1658,10 @@ def pick_payload(picks: list[dict]) -> list[dict]:
             "model_prob": pick.get("prob"),
             "edge": pick.get("edge"),
             "stake": stake_hint(pick),
-            "reason": (pick.get("reason") or "")[:160],
+            "reason": (pick.get("reason") or "")[:80],
         }
         for index, pick in enumerate(picks, 1)
     ]
-
-
-def market_win_rate(stats: dict[str, dict[str, int]]) -> dict[str, float]:
-    rates = {}
-    for market, bag in stats.items():
-        wins = bag.get("全赢", 0) + bag.get("赢半", 0) * 0.5
-        losses = bag.get("全输", 0) + bag.get("输半", 0) * 0.5
-        if wins + losses > 0:
-            # 往 0.5 收缩，避免三五场就把排序带偏。
-            rates[market] = (wins + 2) / (wins + losses + 4)
-    return rates
 
 
 def stake_hint(pick: dict) -> str:
@@ -2999,29 +1686,7 @@ def edge_text(pick: dict) -> str:
     return ("｜" + " ".join(parts)) if parts else ""
 
 
-def pick_score(pick: dict, rates: dict[str, float]) -> float:
-    """排序以「市场校准后的命中概率」为主，正期望只作小幅加分。"""
-    prob = pick.get("prob")
-    if prob is not None:
-        edge = pick.get("edge") or 0.0
-        return float(prob) + max(-0.05, min(0.05, float(edge)))
-    rate = rates.get(pick.get("market") or "", 0.5)
-    return 0.5 + (rate - 0.5) * 0.2
 
-
-def bettable(pick: dict) -> bool:
-    """赔率太低就算中也没什么回报，不放进三场。"""
-    odds = pick.get("odds")
-    return odds is not None and odds >= 1.2
-
-
-def ranked_all(picks: list[dict], stats: dict[str, dict[str, int]]) -> list[dict]:
-    rates = market_win_rate(stats)
-    return sorted(
-        picks,
-        key=lambda pick: (bettable(pick), pick_score(pick, rates)),
-        reverse=True,
-    )
 
 
 def match_key(pick: dict) -> str:
@@ -3045,29 +1710,11 @@ def distinct_matches(ranked: list[dict], limit: int = 3, skip: set[str] | None =
     return out
 
 
-def rule_top3(picks: list[dict], stats: dict[str, dict[str, int]]) -> list[dict]:
-    ranked = distinct_matches(ranked_all(picks, stats), 3)
-    rates = market_win_rate(stats)
-    for pick in ranked:
-        if pick.get("prob") is not None and pick.get("odds") is not None:
-            pick["top_reason"] = (
-                f"市场校准命中率{pick['prob']:.0%}，马会赔率{pick['odds']:g}，"
-                f"期望值{pick['edge']:+.2f}，是今天胜率最高的一档。"
-            )
-            continue
-        rate = rates.get(pick.get("market"))
-        if rate is None:
-            pick["top_reason"] = "过去一周同玩法没有样本，按规则顺序保留。"
-        else:
-            pick["top_reason"] = f"过去一周{pick.get('market')}胜率{rate:.0%}，在今天的候选里排前。"
-    return ranked
-
-
 def ai_top3(day: str, picks: list[dict], recent: list[dict], stats: dict[str, dict[str, int]], notes: list[str]) -> tuple[list[dict], list[str]]:
     if not picks:
         return [], []
     if not LLM_API_KEY:
-        notes.append("没有 LLM_API_KEY，前三按规则胜率排，没有模型复盘。")
+        notes.append("没有 LLM_API_KEY，前三直接按模型命中率排，没有复盘。")
         return rule_top3(picks, stats), []
     payload = {
         "day": day,
@@ -3092,7 +1739,7 @@ def ai_top3(day: str, picks: list[dict], recent: list[dict], stats: dict[str, di
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ])
     except Exception as exc:
-        notes.append(f"模型复盘失败，前三按规则胜率排：{exc}")
+        notes.append(f"模型复盘失败，前三直接按模型命中率排：{exc}")
         return rule_top3(picks, stats), []
     lessons = [str(item).strip() for item in (result.get("lessons") or []) if str(item).strip()][:3]
     chosen = []
@@ -3111,7 +1758,7 @@ def ai_top3(day: str, picks: list[dict], recent: list[dict], stats: dict[str, di
         if len(chosen) == 3:
             break
     if not chosen:
-        notes.append("模型没有给出可用的前三，按规则胜率排。")
+        notes.append("模型没有给出可用的前三，直接按模型命中率排。")
         return rule_top3(picks, stats), lessons
     deduped = []
     seen_matches = set()
@@ -3133,11 +1780,12 @@ def ai_top3(day: str, picks: list[dict], recent: list[dict], stats: dict[str, di
                     f"市场校准命中率{fill['prob']:.0%}，赔率{fill['odds']:g}，期望{fill['edge']:+.2f}。"
                 )
             else:
-                reason = f"没有可用的盘口概率，按{pick.get('market')}的规则顺序保留。"
-            fill["top_reason"] = "规则补充（模型没排这场）：" + reason
+                reason = "没有可用的盘口概率，只按赔率排序。"
+            fill["top_reason"] = "模型没排这场，按命中率补位：" + reason
             chosen.append(fill)
             seen_matches.add(match_key(pick))
     chosen_keys = {(item.get("match"), item.get("market")) for item in chosen}
+    dropped = 0
     for item in result.get("drop") or []:
         try:
             index = int(item.get("index"))
@@ -3148,132 +1796,11 @@ def ai_top3(day: str, picks: list[dict], recent: list[dict], stats: dict[str, di
         pick = picks[index - 1]
         if (pick.get("match"), pick.get("market")) in chosen_keys:
             continue
-        why = str(item.get("why") or "").strip()
-        if why:
-            notes.append(f"模型降级 {pick.get('match')}：{why}")
+        dropped += 1
+    if dropped:
+        notes.append(f"模型把 {dropped} 个候选排在前三之后，理由已并入上面的排序口径。")
     return chosen, lessons
 
-
-def accept_pick(pick: dict) -> bool:
-    market = pick.get("market", "")
-    side = str(pick.get("side") or "")
-    line = str(pick.get("line") or "")
-    if market not in ("让球", "大球", "大角"):
-        return False
-    if pick.get("confidence") == "低":
-        return False
-    if not pick.get("evidence"):
-        return False
-    if market == "让球":
-        if side not in ("主队让球", "客队让球", "主队不败", "客队不败"):
-            return False
-        if any(word in side or word in line for word in ("受让", "加号", "下盘", "+")):
-            return False
-    if market == "大球" and "小" in side:
-        return False
-    if market == "大角" and ("小" in side or side != "大角"):
-        return False
-    return True
-
-
-def render(day, candidates, deep, result, notes, cups, analyzed, board, review=None, top=None) -> str:
-    start, end = slate_window(day)
-    lines = [f"{PUSH_KEYWORD}早筛 {day}｜{start:%m-%d %H:%M} 至 {end:%m-%d %H:%M}", ""]
-    if review:
-        lines.append("【一周回顾】")
-        lines.extend(review)
-        lines.append("")
-    if top:
-        hints = [stake_hint(pick) for pick in top]
-        advice = "都不建议下注" if all(hint == "不下" for hint in hints) else "按命中率排序"
-        lines.append(f"【今日三场｜{advice}】")
-        for index, pick in enumerate(top, 1):
-            lines.append(
-                f"{index}. {pick.get('match')}｜{pick.get('side')} {pick.get('line')}"
-                f"{edge_text(pick)}｜{stake_hint(pick)}"
-            )
-            if pick.get("top_reason"):
-                lines.append(f"   {pick['top_reason']}")
-        edges = [pick.get("edge") for pick in top if pick.get("edge") is not None]
-        if edges and max(edges) < 0:
-            gap = len(top) - len(edges)
-            tail = f"（另有 {gap} 场近况数据不足，算不出期望）" if gap else ""
-            lines.append(f"   注意：能算的期望值都是负的{tail}，今天没有值得加注的场次，建议不下注，或只下最小注。")
-        lines.append("")
-    picks = []
-    skipped = []
-    mentioned = set()
-    if result:
-        for pick in result.get("picks") or []:
-            mentioned.add(pick.get("match"))
-            if accept_pick(pick):
-                picks.append(pick)
-            else:
-                skipped.append(pick)
-    for match in deep:
-        title = match_title(match)
-        if title not in mentioned:
-            skipped.append({"match": title, "reason": "模型未给出可用结论"})
-
-    lines.append("【可做】")
-    if not analyzed:
-        lines.append("这轮没有做近况检索，下面是按积分榜挑出的候选。")
-    elif not picks:
-        lines.append("今天没有读出让球方、大球或大角。")
-    for index, pick in enumerate(picks, 1):
-        lines.append(
-            f"{index}. {pick.get('match')}｜{pick.get('side')} {pick.get('line')}"
-            f"｜{pick.get('confidence')}{edge_text(pick)}"
-        )
-        lines.append(f"   {pick.get('reason')}")
-        if pick.get("risk"):
-            lines.append(f"   风险：{pick.get('risk')}")
-
-    lines.append("")
-    lines.append("【读过但跳过】")
-    if not skipped:
-        lines.append("无")
-    for pick in skipped:
-        lines.append(f"- {pick.get('match')}：{pick.get('reason') or pick.get('market')}")
-
-    deep_ids = {match_title(match) for match in deep}
-    rest = [match for match in candidates if match_title(match) not in deep_ids]
-    lines.append("")
-    lines.append("【前三/后三候选，供再筛】")
-    if not rest:
-        lines.append("无")
-    for match in rest[:30]:
-        lines.append(
-            f"- {match['kickoff']} {match['league']} {match_title(match)}｜{match['why']}"
-            f"｜主{match['home_rank']} 客{match['away_rank']}"
-        )
-    if len(rest) > 30:
-        lines.append(f"- 另有 {len(rest) - 30} 场未展开")
-
-    if board:
-        lines.append("")
-        lines.append("【马会有开，未做近况】")
-        for match in board:
-            lines.append(
-                f"- {match['kickoff']} {match['league']} {match_title(match)}｜{match['why']}｜{match.get('line_text')}"
-            )
-
-    if cups:
-        lines.append("")
-        lines.append("【杯赛】")
-        for match in cups[:15]:
-            flag = "谨慎，青年军风险" if match["caution"] else match["why"]
-            lines.append(f"- {match['kickoff']} {match['league']} {match_title(match)}｜{flag}")
-        if len(cups) > 15:
-            lines.append(f"- 另有 {len(cups) - 15} 场杯赛未展开")
-
-    if notes:
-        lines.append("")
-        lines.append("【数据备注】")
-        lines.extend(f"- {note}" for note in notes[:12])
-    lines.append("")
-    lines.append("下单前再看一眼马会即时盘。这是筛选简报。")
-    return "\n".join(lines)
 
 
 def mail_recipients() -> list[str]:
@@ -3338,93 +1865,59 @@ def push(text: str, dry_run: bool) -> None:
     resp.raise_for_status()
 
 
-def fill_focus_ranks_from_search(leagues: list[dict], notes: list[str]) -> None:
-    pending = [
-        league for league in leagues
-        if league.get("ranks") is None
-        and not is_cup(league["name"])
-        and is_focus_league(league["country"], league["name"])
+def pick_line(pick: dict) -> str:
+    return f"{pick.get('market')}｜{pick.get('side')} {pick.get('line')}｜{edge_text(pick).lstrip('｜')}｜{stake_hint(pick)}"
+
+
+def summary_block(top: list[dict]) -> list[str]:
+    lines = ["【概率最优三场】"]
+    if not top:
+        lines.append("- 没有达到概率门槛的方向，今天空仓。")
+        return lines
+    for index, pick in enumerate(top, 1):
+        lines.append(f"{index}. {pick.get('match')}")
+        lines.append(f"   {pick_line(pick)}")
+        if pick.get("top_reason"):
+            lines.append(f"   复盘理由：{pick['top_reason']}")
+        if pick.get("reason"):
+            lines.append(f"   分布依据：{pick['reason']}")
+    return lines
+
+
+def candidate_lines(shown: list[dict], top: list[dict]) -> list[str]:
+    used = {(pick.get("match"), pick.get("market"), pick.get("side"), pick.get("line")) for pick in top}
+    rest = [pick for pick in shown
+            if (pick.get("match"), pick.get("market"), pick.get("side"), pick.get("line")) not in used]
+    if not rest:
+        return []
+    lines = ["【候选排行（按模型命中率）】"]
+    for pick in rest:
+        lines.append(f"- {pick['prob']:.0%}｜{pick.get('match')}｜{pick_line(pick)}")
+    return lines
+
+
+def render(day: str, matches: list[dict], shown: list[dict], top: list[dict],
+           notes: list[str], review: list[str]) -> str:
+    start, end = slate_window(day)
+    lines = [
+        f"{PUSH_KEYWORD}早筛 {day}｜窗口 {start:%m-%d %H:%M} 至 {end:%m-%d %H:%M}",
+        "口径：全部由概率分布算出。命中率来自马会总入球盘和主客和盘反推的进球分布，近况只做修正；"
+        "期望 = 命中率×赔率−1，期望为负一律标「不下」。",
+        "",
     ]
-    if not pending:
-        return
-    if not SEARCH_API_KEY or not LLM_API_KEY:
-        notes.append("芬兰、挪威、沙特、日本有比赛，但没有搜索密钥，积分榜未核对。")
-        return
-    packs = []
-    for league in pending:
-        teams = []
-        for item in league["fixtures"]:
-            teams.extend([item["teams"]["home"]["name"], item["teams"]["away"]["name"]])
-        try:
-            snippets = search(f"{league['country']} {league['name']} current standings table 2026")
-        except Exception as exc:
-            notes.append(f"积分榜检索失败 {league['name']}：{exc}")
-            snippets = []
-        packs.append({
-            "league": league["name"],
-            "country": league["country"],
-            "teams": sorted(set(teams)),
-            "snippets": snippets[:8],
-        })
-    try:
-        result = llm([
-            {
-                "role": "system",
-                "content": "只根据检索摘要提取积分榜名次。摘要没有写明的球队不要输出，禁止编造名次。",
-            },
-            {
-                "role": "user",
-                "content": (
-                    "返回 JSON："
-                    "{\"tables\":[{\"league\":\"联赛名\",\"total\":球队总数,"
-                    "\"rows\":[{\"team\":\"必须是给定名单里的原名\",\"rank\":1}]}]}\n"
-                    + json.dumps(packs, ensure_ascii=False)
-                ),
-            },
-        ])
-    except Exception as exc:
-        notes.append(f"重点联赛积分榜解析失败：{exc}")
-        return
-    by_name = {league["name"]: league for league in pending}
-    for table in result.get("tables") or []:
-        league = by_name.get(table.get("league"))
-        if league is None:
-            continue
-        try:
-            total = int(table.get("total") or 0)
-        except (TypeError, ValueError):
-            total = 0
-        id_by_name = {}
-        for item in league["fixtures"]:
-            for side in ("home", "away"):
-                team = item["teams"][side]
-                id_by_name[squash_name(team["name"])] = (team["id"], team["name"])
-        ranks = {}
-        for row in table.get("rows") or []:
-            found = id_by_name.get(squash_name(str(row.get("team") or "")))
-            if not found:
-                continue
-            try:
-                rank = int(row.get("rank"))
-            except (TypeError, ValueError):
-                continue
-            if rank <= 0 or (total and rank > total):
-                continue
-            team_id, team_name = found
-            flags = []
-            if rank <= 3:
-                flags.append("前三")
-            if total >= 6 and rank > total - 3:
-                flags.append("后三")
-            ranks[team_id] = {
-                "rank": rank,
-                "total": total or rank,
-                "flags": flags,
-                "name": team_name,
-            }
-        if ranks:
-            league["ranks"] = ranks
-            notes.append(f"{league['name']} 的名次来自检索，只核到本场球队。")
+    lines.extend(summary_block(top))
+    extra = candidate_lines(shown, top)
+    if extra:
+        lines.append("")
+        lines.extend(extra)
+    lines.append("")
+    lines.append("【复盘】")
+    lines.extend(review or ["- 还没有可结算的历史。"])
+    if notes:
+        lines.append("")
+        lines.append("【数据】")
+        lines.extend(f"- {note}" for note in notes)
+    return "\n".join(lines)
 
 
 def main() -> None:
@@ -3432,63 +1925,44 @@ def main() -> None:
     parser.add_argument("--date", help="触发日 YYYY-MM-DD，默认今天。26 日会研究 26 日 12:00 到 27 日 12:00")
     parser.add_argument("--dry-run", action="store_true", help="只打印，不推送")
     args = parser.parse_args()
-    if not APIFOOTBALL_KEY and not FOOTBALL_DATA_KEY:
-        raise SystemExit("缺少 APIFOOTBALL_KEY 或 FOOTBALL_DATA_KEY")
 
     day = args.date or datetime.now(TZ).strftime("%Y-%m-%d")
-    api = ApiFootball(APIFOOTBALL_KEY) if APIFOOTBALL_KEY else None
-    fd = FootballData(FOOTBALL_DATA_KEY) if FOOTBALL_DATA_KEY else None
-    candidates, notes, cups, board, plain, focus = build_candidates(api, fd, day)
-    deep = [match for match in candidates if not match["caution"]][:MAX_DEEP]
-    researching = deep + plain
-    picks = []
-    analyzed = False
-    if researching:
-        gather_context(researching)
-        if deep:
-            picks.extend(analyze(deep)["picks"])
-        if plain:
-            picks.extend(analyze_plain(plain)["picks"])
-        analyzed = True
-        notes.append("前三后三先看让球方穿盘，再看大球、大角。没有前三后三的场次先看大球，再用胜负看让球方，最后看大角。")
-    if focus:
-        for match in focus:
-            picks.extend(judge_focus(match))
-        analyzed = True
-        notes.append("亚冠、法甲、法乙、丹超、葡超按强队身份、进球和近况判断。让球只做让球方，浅盘不败用主客和盘。大球看实际总进球。")
-    result = {"picks": picks} if analyzed else None
-
-    shown = [pick for pick in picks if accept_pick(pick)]
-    analyzed_matches = researching + focus
-    attach_meta(shown, analyzed_matches)
-    unpriced = [pick for pick in shown if "不败" in str(pick.get("side")) and not pick.get("odds")]
-    if unpriced:
-        notes.append(f"{len(unpriced)} 场不败没有主客和盘口，拿不到赔率，已经剔除。")
-    shown = [pick for pick in shown if pick not in unpriced]
+    notes: list[str] = []
+    pool = screen(day, notes)
+    shown = [pick for pick in pool if pick["prob"] >= SCREEN_MIN_PROB][:SHOW_LIMIT]
+    if not shown and pool:
+        shown = pool[:min(3, SHOW_LIMIT)]
+        notes.append(f"没有方向达到 {SCREEN_MIN_PROB:.0%} 命中率，下面只是参考排序，不建议下注。")
+    if pool:
+        best = max(pool, key=lambda pick: pick.get("edge") or -9)
+        notes.append(
+            f"全场 {len(pool)} 个方向里期望最高的是 {best['market']} {best['side']} {best['line']}"
+            f"（{best['match']}，期望{best['edge']:+.3f}）。"
+        )
+        if not any((pick.get("edge") or 0) > 0.005 for pick in pool):
+            notes.append(
+                "没有任何方向期望为正：概率本身就来自马会盘口，扣掉抽水后必然为负。"
+                "命中率排序只回答「哪个更容易中」，变不出正期望。"
+            )
 
     history = load_history()
     settled, pending = settle_history(history, day)
     if (settled or pending) and not args.dry_run:
         save_history(history)
     recent, stats = weekly_review(day, history)
-    observed = observed_review(day, history)
-    if not args.dry_run:
+    if not args.dry_run and shown:
         added, refreshed = record_history(day, shown)
         if added:
-            notes.append(f"今天的方向已记入历史 {added} 条，下次跑用 ESPN 赛果回看。")
+            notes.append(f"今天 {added} 个方向已记入历史，下次跑用 ESPN 赛果结算。")
         if refreshed:
-            notes.append(f"历史里有 {refreshed} 条补上了赔率和概率，校准开始有样本。")
-        watched = record_observations(day, analyzed_matches, shown)
-        if watched:
-            notes.append(f"另外记下 {watched} 场被跳过的比赛，之后用赛果检验过滤规则。")
+            notes.append(f"历史里 {refreshed} 条补上了赔率和概率，校准样本增加。")
 
     top, lessons = ai_top3(day, shown, recent, stats, notes)
     review = review_lines(day, recent, stats, pending)
     review.extend(calibration_report(day, history))
-    review.extend(observed)
     review.extend(f"- 经验：{lesson}" for lesson in lessons)
 
-    text = render(day, candidates, researching, result, notes, cups, analyzed, board, review, top)
+    text = render(day, [], shown, top, notes, review)
     push(text, args.dry_run)
 
 
