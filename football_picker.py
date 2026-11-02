@@ -2058,6 +2058,436 @@ def llm(messages: list[dict]) -> dict:
     return parse_json(content)
 
 
+HISTORY_FILE = ROOT / "picks-history.jsonl"
+REVIEW_DAYS = 7
+
+
+def parse_kickoff(text: str) -> datetime:
+    return datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+
+
+def load_history() -> list[dict]:
+    if not HISTORY_FILE.exists():
+        return []
+    rows = []
+    for raw in HISTORY_FILE.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def save_history(rows: list[dict]) -> None:
+    text = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
+    HISTORY_FILE.write_text(text + ("\n" if text else ""), encoding="utf-8")
+
+
+def attach_meta(picks: list[dict], matches: list[dict]) -> None:
+    by_title = {match_title(match): match for match in matches}
+    for pick in picks:
+        label = pick.get("match") or ""
+        match = next((item for title, item in by_title.items() if title and title in label), None)
+        if match is None:
+            continue
+        today = match.get("hkjc") or {}
+        home_line = today.get("home_line")
+        if home_line is None:
+            favorite = None
+            depth = None
+        elif home_line < -0.01:
+            favorite = "home"
+            depth = abs(home_line)
+        elif home_line > 0.01:
+            favorite = "away"
+            depth = abs(home_line)
+        else:
+            favorite = None
+            depth = None
+        pick["meta"] = {
+            "no": match.get("hkjc_no"),
+            "kickoff": match.get("sort"),
+            "league": match.get("league"),
+            "league_en": match.get("league_en"),
+            "country": match.get("country"),
+            "home": match.get("home"),
+            "away": match.get("away"),
+            "depth": depth,
+            "favorite": favorite,
+            "total_value": today.get("total"),
+            "corner_value": today.get("corner_line"),
+        }
+
+
+def record_history(day: str, picks: list[dict]) -> int:
+    rows = load_history()
+    seen = {
+        (row.get("run_day"), row.get("no"), row.get("market"), row.get("side"), row.get("line"))
+        for row in rows
+    }
+    added = 0
+    for pick in picks:
+        meta = pick.get("meta")
+        if not meta or not meta.get("no"):
+            continue
+        key = (day, meta["no"], pick.get("market"), pick.get("side"), pick.get("line"))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({
+            "run_day": day,
+            "no": meta["no"],
+            "kickoff": meta.get("kickoff"),
+            "league": meta.get("league"),
+            "league_en": meta.get("league_en"),
+            "country": meta.get("country"),
+            "home": meta.get("home"),
+            "away": meta.get("away"),
+            "market": pick.get("market"),
+            "side": pick.get("side"),
+            "line": pick.get("line"),
+            "depth": meta.get("depth"),
+            "favorite": meta.get("favorite"),
+            "total_value": meta.get("total_value"),
+            "corner_value": meta.get("corner_value"),
+            "confidence": pick.get("confidence"),
+            "reason": pick.get("reason"),
+            "settlement": None,
+            "home_goals": None,
+            "away_goals": None,
+            "corner_total": None,
+            "settled_day": None,
+        })
+        added += 1
+    if added:
+        save_history(rows)
+    return added
+
+
+def espn_day_results(slug: str, day: str) -> list[dict]:
+    def load():
+        body = espn_get(
+            f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard",
+            {"dates": day.replace("-", "")},
+        )
+        rows = []
+        for event in body.get("events") or []:
+            competition = (event.get("competitions") or [{}])[0]
+            status = ((competition.get("status") or {}).get("type") or {}).get("name") or ""
+            sides = {}
+            for item in competition.get("competitors") or []:
+                sides[item.get("homeAway")] = {
+                    "id": str((item.get("team") or {}).get("id") or ""),
+                    "name": (item.get("team") or {}).get("displayName") or "",
+                    "score": goal_number(item.get("score")),
+                }
+            rows.append({
+                "id": str(event.get("id") or ""),
+                "status": status,
+                "home": sides.get("home") or {},
+                "away": sides.get("away") or {},
+            })
+        return rows
+
+    return cached_json(f"espn-results-{slug}-{day}.json", load, max_age_hours=6)
+
+
+def find_result(row: dict) -> dict | None:
+    slug = espn_slug_for(row.get("country") or "", row.get("league_en") or "")
+    if slug is None or not row.get("kickoff"):
+        return None
+    kick = datetime.fromisoformat(row["kickoff"])
+    days = list(dict.fromkeys((
+        kick.astimezone(timezone.utc).strftime("%Y-%m-%d"),
+        kick.astimezone(TZ).strftime("%Y-%m-%d"),
+    )))
+    best = None
+    best_score = 0
+    for day in days:
+        try:
+            events = espn_day_results(slug, day)
+        except requests.RequestException:
+            continue
+        for event in events:
+            if event["status"] not in ("STATUS_FULL_TIME", "STATUS_FINAL", "STATUS_FINAL_AET", "STATUS_FINAL_PEN"):
+                continue
+            home_score = name_score(row.get("home") or "", event["home"].get("name") or "")
+            away_score = name_score(row.get("away") or "", event["away"].get("name") or "")
+            if home_score < 60 or away_score < 60:
+                continue
+            if event["home"].get("score") is None or event["away"].get("score") is None:
+                continue
+            if home_score + away_score > best_score:
+                best_score = home_score + away_score
+                best = {"slug": slug, **event}
+    return best
+
+
+def event_corners(slug: str, event_id: str) -> dict:
+    def load():
+        body = espn_get(
+            f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/summary",
+            {"event": event_id},
+        )
+        corners = {}
+        for team in (body.get("boxscore") or {}).get("teams") or []:
+            team_id = str((team.get("team") or {}).get("id") or "")
+            for stat in team.get("statistics") or []:
+                if stat.get("name") == "wonCorners" and str(stat.get("displayValue") or "").isdigit():
+                    corners[team_id] = int(stat["displayValue"])
+        return {"corners": corners}
+
+    try:
+        data = cached_json(f"espn-corners2-{event_id}.json", load)
+    except requests.RequestException:
+        return {}
+    return data.get("corners") or {}
+
+
+def settle_row(row: dict, result: dict, corners: dict) -> str | None:
+    home_goals = result["home"].get("score")
+    away_goals = result["away"].get("score")
+    if home_goals is None or away_goals is None:
+        return None
+    market = row.get("market")
+    if market == "让球":
+        depth = row.get("depth")
+        if depth is None:
+            return None
+        if row.get("favorite") == "home":
+            margin = home_goals - away_goals
+        elif row.get("favorite") == "away":
+            margin = away_goals - home_goals
+        else:
+            return None
+        return settle_asian(margin, -float(depth))
+    if market == "大球":
+        line = row.get("total_value")
+        if line is None:
+            return None
+        return settle_asian(home_goals + away_goals, -float(line))
+    if market == "大角":
+        line = row.get("corner_value")
+        values = [int(value) for value in (corners or {}).values()]
+        if line is None or len(values) != 2:
+            return None
+        return settle_asian(sum(values), -float(line))
+    return None
+
+
+def settle_history(rows: list[dict], day: str) -> int:
+    horizon = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=TZ) - timedelta(days=REVIEW_DAYS + 1)
+    now = datetime.now(TZ)
+    changed = 0
+    for row in rows:
+        if row.get("settlement") or not row.get("kickoff"):
+            continue
+        when = parse_kickoff(row["kickoff"])
+        if when >= now - timedelta(hours=2) or when < horizon:
+            continue
+        try:
+            result = find_result(row)
+        except requests.RequestException:
+            continue
+        if result is None:
+            continue
+        corners = event_corners(result["slug"], result["id"]) if row.get("market") == "大角" else {}
+        settlement = settle_row(row, result, corners)
+        if settlement is None:
+            continue
+        row["settlement"] = settlement
+        row["home_goals"] = result["home"]["score"]
+        row["away_goals"] = result["away"]["score"]
+        values = [int(value) for value in (corners or {}).values()]
+        row["corner_total"] = sum(values) if len(values) == 2 else None
+        row["settled_day"] = day
+        changed += 1
+    return changed
+
+
+def weekly_review(day: str, rows: list[dict]) -> tuple[list[dict], dict[str, dict[str, int]]]:
+    horizon = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=TZ) - timedelta(days=REVIEW_DAYS)
+    recent = [
+        row for row in rows
+        if row.get("settlement") and row.get("kickoff") and parse_kickoff(row["kickoff"]) >= horizon
+    ]
+    recent.sort(key=lambda row: row["kickoff"])
+    stats: dict[str, dict[str, int]] = {}
+    for row in recent:
+        bag = stats.setdefault(row.get("market") or "", {})
+        bag[row["settlement"]] = bag.get(row["settlement"], 0) + 1
+    return recent, stats
+
+
+def tab_text(row: dict) -> str:
+    score = ""
+    if row.get("home_goals") is not None:
+        score = f"{row['home_goals']}-{row['away_goals']}"
+    corner = ""
+    if row.get("market") == "大角" and row.get("corner_total") is not None:
+        corner = f" 角球{row['corner_total']}"
+    date = (row.get("kickoff") or "")[5:10]
+    return (
+        f"{date} {row.get('league')} {row.get('side')} {row.get('line')}"
+        f"｜{score}{corner}｜{row.get('settlement')}"
+    )
+
+
+def bag_line(market: str, bag: dict[str, int]) -> str:
+    parts = [f"{key}{bag[key]}" for key in ("全赢", "赢半", "走水", "输半", "全输") if bag.get(key)]
+    return f"{market}：{'，'.join(parts) if parts else '没有结算'}"
+
+
+def review_lines(day: str, recent: list[dict], stats: dict[str, dict[str, int]]) -> list[str]:
+    horizon = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=TZ) - timedelta(days=REVIEW_DAYS)
+    label = f"{horizon:%m-%d} 至 {day[5:]}"
+    if not recent:
+        return [f"过去 {REVIEW_DAYS} 天（{label}）没有已结算的推荐，今天先按规则排。"]
+    wins = sum(bag.get("全赢", 0) + bag.get("赢半", 0) for bag in stats.values())
+    losses = sum(bag.get("全输", 0) + bag.get("输半", 0) for bag in stats.values())
+    lines = [f"过去 {REVIEW_DAYS} 天（{label}）已结算 {len(recent)} 场：赢 {wins}，输 {losses}。"]
+    for market in ("让球", "大球", "大角"):
+        if stats.get(market):
+            lines.append("- " + bag_line(market, stats[market]))
+    lines.extend("- " + tab_text(row) for row in recent[-8:])
+    return lines
+
+
+def weekly_payload(recent: list[dict]) -> list[dict]:
+    return [
+        {
+            "date": (row.get("kickoff") or "")[:10],
+            "league": row.get("league"),
+            "market": row.get("market"),
+            "side": row.get("side"),
+            "line": row.get("line"),
+            "score": f"{row.get('home_goals')}-{row.get('away_goals')}",
+            "corner_total": row.get("corner_total"),
+            "settlement": row.get("settlement"),
+        }
+        for row in recent[-20:]
+    ]
+
+
+def pick_payload(picks: list[dict]) -> list[dict]:
+    return [
+        {
+            "index": index,
+            "match": pick.get("match"),
+            "market": pick.get("market"),
+            "side": pick.get("side"),
+            "line": pick.get("line"),
+            "confidence": pick.get("confidence"),
+            "reason": (pick.get("reason") or "")[:160],
+        }
+        for index, pick in enumerate(picks, 1)
+    ]
+
+
+def market_win_rate(stats: dict[str, dict[str, int]]) -> dict[str, float]:
+    rates = {}
+    for market, bag in stats.items():
+        wins = bag.get("全赢", 0) + bag.get("赢半", 0) * 0.5
+        losses = bag.get("全输", 0) + bag.get("输半", 0) * 0.5
+        if wins + losses > 0:
+            rates[market] = wins / (wins + losses)
+    return rates
+
+
+def rule_top3(picks: list[dict], stats: dict[str, dict[str, int]]) -> list[dict]:
+    rates = market_win_rate(stats)
+
+    def score(pick: dict) -> float:
+        rate = rates.get(pick.get("market") or "", 0.5)
+        confidence = 0.15 if pick.get("confidence") == "高" else 0.0
+        return rate + confidence
+
+    ranked = sorted(picks, key=score, reverse=True)[:3]
+    for pick in ranked:
+        rate = rates.get(pick.get("market"))
+        if rate is None:
+            pick["top_reason"] = "过去一周同玩法没有样本，按规则顺序保留。"
+        else:
+            pick["top_reason"] = f"过去一周{pick.get('market')}胜率{rate:.0%}，在今天的候选里排前。"
+    return ranked
+
+
+def ai_top3(day: str, picks: list[dict], recent: list[dict], stats: dict[str, dict[str, int]], notes: list[str]) -> tuple[list[dict], list[str]]:
+    if not picks:
+        return [], []
+    if not LLM_API_KEY:
+        notes.append("没有 LLM_API_KEY，前三按规则胜率排，没有模型复盘。")
+        return rule_top3(picks, stats), []
+    payload = {
+        "day": day,
+        "recent_settled": weekly_payload(recent),
+        "today_candidates": pick_payload(picks),
+    }
+    try:
+        result = llm([
+            {
+                "role": "system",
+                "content": (
+                    "你是足球让球、大球、大角的复盘助手。只能使用用户给出的已结算记录和今日候选，"
+                    "禁止编造比分、盘口、角球或球队。不能新增候选，不能修改玩法、方向、盘口，只能排序并说明理由。"
+                    "输出 JSON：{\"lessons\":[最多3条中文经验],"
+                    "\"top\":[{\"index\":候选序号,\"reason\":中文理由}],"
+                    "\"drop\":[{\"index\":候选序号,\"why\":中文原因}]}。top 最多 3 个，按把握从高到低。"
+                ),
+            },
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ])
+    except Exception as exc:
+        notes.append(f"模型复盘失败，前三按规则胜率排：{exc}")
+        return rule_top3(picks, stats), []
+    lessons = [str(item).strip() for item in (result.get("lessons") or []) if str(item).strip()][:3]
+    chosen = []
+    used = set()
+    for item in result.get("top") or []:
+        try:
+            index = int(item.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if index < 1 or index > len(picks) or index in used:
+            continue
+        used.add(index)
+        pick = dict(picks[index - 1])
+        pick["top_reason"] = str(item.get("reason") or "").strip()
+        chosen.append(pick)
+        if len(chosen) == 3:
+            break
+    if not chosen:
+        notes.append("模型没有给出可用的前三，按规则胜率排。")
+        return rule_top3(picks, stats), lessons
+    if len(chosen) < 3:
+        for pick in rule_top3(picks, stats):
+            if len(chosen) == 3:
+                break
+            if pick.get("match") in {item.get("match") for item in chosen}:
+                continue
+            fill = dict(pick)
+            fill["top_reason"] = fill.get("top_reason") or "模型只排了两场，这场按规则胜率补上。"
+            chosen.append(fill)
+    chosen_keys = {(item.get("match"), item.get("market")) for item in chosen}
+    for item in result.get("drop") or []:
+        try:
+            index = int(item.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if index < 1 or index > len(picks):
+            continue
+        pick = picks[index - 1]
+        if (pick.get("match"), pick.get("market")) in chosen_keys:
+            continue
+        why = str(item.get("why") or "").strip()
+        if why:
+            notes.append(f"模型降级 {pick.get('match')}：{why}")
+    return chosen, lessons
+
+
 def accept_pick(pick: dict) -> bool:
     market = pick.get("market", "")
     side = str(pick.get("side") or "")
@@ -2080,9 +2510,20 @@ def accept_pick(pick: dict) -> bool:
     return True
 
 
-def render(day, candidates, deep, result, notes, cups, analyzed, board) -> str:
+def render(day, candidates, deep, result, notes, cups, analyzed, board, review=None, top=None) -> str:
     start, end = slate_window(day)
     lines = [f"{PUSH_KEYWORD}早筛 {day}｜{start:%m-%d %H:%M} 至 {end:%m-%d %H:%M}", ""]
+    if review:
+        lines.append("【一周回顾】")
+        lines.extend(review)
+        lines.append("")
+    if top:
+        lines.append("【今日三场】")
+        for index, pick in enumerate(top, 1):
+            lines.append(f"{index}. {pick.get('match')}｜{pick.get('side')} {pick.get('line')}")
+            if pick.get("top_reason"):
+                lines.append(f"   {pick['top_reason']}")
+        lines.append("")
     picks = []
     skipped = []
     mentioned = set()
@@ -2340,7 +2781,24 @@ def main() -> None:
         notes.append("亚冠、法甲、法乙、丹超、葡超按强队身份、进球和近况判断。让球只做让球方或不败。大球看实际总进球。")
     result = {"picks": picks} if analyzed else None
 
-    text = render(day, candidates, researching, result, notes, cups, analyzed, board)
+    shown = [pick for pick in picks if accept_pick(pick)]
+    attach_meta(shown, researching + focus)
+
+    history = load_history()
+    settled = settle_history(history, day)
+    if settled and not args.dry_run:
+        save_history(history)
+    recent, stats = weekly_review(day, history)
+    if not args.dry_run:
+        added = record_history(day, shown)
+        if added:
+            notes.append(f"今天的方向已记入历史 {added} 条，下次跑用 ESPN 赛果回看。")
+
+    top, lessons = ai_top3(day, shown, recent, stats, notes)
+    review = review_lines(day, recent, stats)
+    review.extend(f"- 经验：{lesson}" for lesson in lessons)
+
+    text = render(day, candidates, researching, result, notes, cups, analyzed, board, review, top)
     push(text, args.dry_run)
 
 
