@@ -1179,8 +1179,6 @@ def odds_for(card: dict, market: str, side: str) -> float | None:
     elif market == "大角":
         rows, want = prices.get("CHL") or [], "H"
     elif market == "让球":
-        if "不败" in str(side):
-            return None
         rows = prices.get("HDC") or []
         want = "H" if side == "主队让球" else "A"
     else:
@@ -2003,13 +2001,6 @@ def focus_handicap(match: dict, home: dict, away: dict, home_line: float) -> dic
     cn = match["home_ch"] if favorite_home else match["away_ch"]
     opp_cn = match["away_ch"] if favorite_home else match["home_ch"]
 
-    if len(recent) >= 5 and all(game["outcome"] != "负" for game in recent) and depth <= 0.5 + 0.01:
-        return {
-            "side": place + "不败",
-            "line": label,
-            "reason": f"{cn}近{len(recent)}场没有输球，盘口是{label}。支持不败。",
-            "evidence": [f"{game['date']} {game['goals_for']}-{game['goals_against']} {game['opponent']}" for game in recent[:4]],
-        }
     if tag and 1.5 - 0.01 <= depth <= 2.0 + 0.01 and len(opp_same) >= 2 and all(game["outcome"] != "胜" for game in opp_same):
         return {
             "side": place + "让球",
@@ -2309,7 +2300,7 @@ def attach_meta(picks: list[dict], matches: list[dict]) -> None:
             "favorite": favorite,
             "total_value": today.get("total"),
             "corner_value": today.get("corner_line"),
-            "kind": "win_or_draw" if "不败" in str(pick.get("side") or "") else pick.get("market"),
+            "kind": pick.get("market"),
         }
         lam = goal_expectation(
             match.get("home_report") or {}, match.get("away_report") or {},
@@ -2524,14 +2515,8 @@ def settle_row(row: dict, result: dict, corners: dict) -> str | None:
     if home_goals is None or away_goals is None:
         return None
     if row.get("kind") == "win_or_draw":
-        # 不败是双重机会，平局算赢，没有走水。
-        if row.get("favorite") == "home":
-            margin = home_goals - away_goals
-        elif row.get("favorite") == "away":
-            margin = away_goals - home_goals
-        else:
-            return None
-        return "全赢" if margin >= 0 else "全输"
+        # 旧数据里可能有这个类型，程序已经没有对应的真实玩法，不做推断。
+        return None
     market = row.get("market")
     if market == "让球":
         depth = row.get("depth")
@@ -2906,7 +2891,7 @@ def accept_pick(pick: dict) -> bool:
     if not pick.get("evidence"):
         return False
     if market == "让球":
-        if side not in ("主队让球", "客队让球", "主队不败", "客队不败"):
+        if side not in ("主队让球", "客队让球"):
             return False
         if any(word in side or word in line for word in ("受让", "加号", "下盘", "+")):
             return False
@@ -3193,7 +3178,7 @@ def main() -> None:
         for match in focus:
             picks.extend(judge_focus(match))
         analyzed = True
-        notes.append("亚冠、法甲、法乙、丹超、葡超按强队身份、进球和近况判断。让球只做让球方或不败。大球看实际总进球。")
+        notes.append("亚冠、法甲、法乙、丹超、葡超按强队身份、进球和近况判断。让球只做让球方。大球看实际总进球。")
     result = {"picks": picks} if analyzed else None
 
     shown = [pick for pick in picks if accept_pick(pick)]
