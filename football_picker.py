@@ -1335,6 +1335,15 @@ def double_chance_odds(card: dict, scope: str) -> float | None:
     return round(combined, 3)
 
 
+def market_view(card: dict, home_report: dict, away_report: dict) -> dict:
+    """三种口径各算一套期望进球，方便之后用赛果比较谁更准。"""
+    return {
+        "market": market_lambdas(card),
+        "form": goal_expectation(home_report, away_report),
+        "blended": blended_lambdas(card, home_report, away_report),
+    }
+
+
 def pick_probability(pick: dict, meta: dict, lam: tuple[float, float] | None, odds: float | None) -> dict:
     """用融合后的期望进球算命中概率和期望值。"""
     result = {"prob": None, "edge": None, "odds": odds}
@@ -2466,12 +2475,20 @@ def attach_meta(picks: list[dict], matches: list[dict]) -> None:
         }
         home_report = match.get("home_report") or {}
         away_report = match.get("away_report") or {}
-        lam = blended_lambdas(today, home_report, away_report)
+        views = market_view(today, home_report, away_report)
+        lam = views["blended"]
         pick["meta"]["corner_lam"] = corner_lambda(home_report, away_report)
         pick["meta"]["lambda"] = lam
+        pick["meta"]["lambda_market"] = views["market"]
+        pick["meta"]["lambda_form"] = views["form"]
         odds = odds_for(today, pick.get("market"), pick.get("side"))
         view = pick_probability(pick, pick["meta"], lam, odds)
         pick.update(view)
+        # 同时存下市场口径和近况口径，之后用 Brier 分数判断哪个更准。
+        for key in ("market", "form"):
+            alt = pick_probability(pick, pick["meta"], views[key], odds)
+            pick[f"prob_{key}"] = alt.get("prob")
+            pick[f"edge_{key}"] = alt.get("edge")
 
 
 def history_row(day: str, pick: dict, kind: str) -> dict | None:
@@ -2501,6 +2518,8 @@ def history_row(day: str, pick: dict, kind: str) -> dict | None:
         "odds": pick.get("odds"),
         "prob": pick.get("prob"),
         "edge": pick.get("edge"),
+        "prob_market": pick.get("prob_market"),
+        "prob_form": pick.get("prob_form"),
         "reason": pick.get("reason"),
         "settlement": None,
         "home_goals": None,
@@ -2511,7 +2530,8 @@ def history_row(day: str, pick: dict, kind: str) -> dict | None:
     }
 
 
-REFRESH_FIELDS = ("kind", "scope", "model", "odds", "prob", "edge", "confidence", "reason",
+REFRESH_FIELDS = ("kind", "scope", "model", "odds", "prob", "edge", "prob_market", "prob_form",
+                  "confidence", "reason",
                   "depth", "favorite", "total_value", "corner_value", "league", "league_en", "country")
 
 
@@ -2793,13 +2813,22 @@ def weekly_review(day: str, rows: list[dict]) -> tuple[list[dict], dict[str, dic
     return recent, stats
 
 
+def brier(rows: list[dict], field: str) -> float | None:
+    graded = [row for row in rows if row.get(field) is not None]
+    if not graded:
+        return None
+    return sum(
+        (float(row[field]) - (1.0 if row["settlement"] == "全赢" else 0.0)) ** 2
+        for row in graded
+    ) / len(graded)
+
+
 def calibration_report(day: str, rows: list[dict]) -> list[str]:
-    """用已结算且有预测概率的场次检查概率准不准，这是「准确率」唯一可验证的口径。"""
+    """用已结算场次比较「市场口径 / 近况口径 / 融合口径」谁更准，这是唯一可验证的准确率口径。"""
     horizon = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=TZ) - timedelta(days=REVIEW_DAYS * 4)
     graded = [
         row for row in rows
         if row.get("prob") is not None
-        and row.get("model") == MODEL_TAG
         and row.get("settlement") in ("全赢", "全输")
         and row.get("kickoff") and parse_kickoff(row["kickoff"]) >= horizon
     ]
@@ -2807,15 +2836,25 @@ def calibration_report(day: str, rows: list[dict]) -> list[str]:
         return []
     predicted = sum(float(row["prob"]) for row in graded) / len(graded)
     actual = sum(1 for row in graded if row["settlement"] == "全赢") / len(graded)
-    brier = sum(
-        (float(row["prob"]) - (1.0 if row["settlement"] == "全赢" else 0.0)) ** 2
-        for row in graded
-    ) / len(graded)
-    lines = [f"概率校准：{len(graded)} 场，平均预测 {predicted:.0%}，实际命中 {actual:.0%}，Brier {brier:.3f}。"]
+    lines = [f"概率校准：{len(graded)} 场，平均预测 {predicted:.0%}，实际命中 {actual:.0%}。"]
     if predicted - actual > 0.08:
-        lines.append("预测偏高，说明模型太乐观，注码要压小。")
+        lines.append("预测偏高，模型太乐观，注码要压小。")
     elif actual - predicted > 0.08:
         lines.append("实际命中高于预测，模型偏保守。")
+    for label, field in (("融合", "prob"), ("市场", "prob_market"), ("近况", "prob_form")):
+        score = brier(graded, field)
+        if score is not None:
+            lines.append(f"- {label}口径 Brier {score:.3f}（越小越准）")
+    market_score = brier(graded, "prob_market")
+    form_score = brier(graded, "prob_form")
+    if market_score is not None and form_score is not None:
+        gap = market_score - form_score
+        if gap > 0.01:
+            lines.append("近况口径更准，可以调高近况权重。")
+        elif gap < -0.01:
+            lines.append("市场口径更准，近况权重不宜再调高。")
+        else:
+            lines.append("两种口径差不多，继续以市场为锚。")
     return lines
 
 
