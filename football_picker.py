@@ -90,18 +90,27 @@ def is_cup(name: str) -> bool:
     return any(k in n for k in ("cup", "copa", "coupe", "pokal", "trophy"))
 
 
-def is_serious_cup(name: str) -> bool:
+# 洲际/跨国俱乐部赛事。名字里未必带 cup，而且没有联赛积分榜，
+# 和「按联赛成绩判断」这套逻辑不兼容，所以单独识别。
+CONTINENTAL_KEYS = (
+    "champions league",       # 亞冠、歐冠、非冠
+    "europa league",
+    "conference league",
+    "libertadores",           # 南美解放者杯
+    "sudamericana",           # 南美杯
+)
+
+
+def is_continental(name: str) -> bool:
     n = norm(name)
-    return any(k in n for k in ("fa cup", "copa del rey", "dfb-pokal", "dfb pokal"))
+    # 马会把欧足联赛事缩写成 UE 开头：UE Champions（欧冠）、UE Cup（欧霸）。
+    if n.startswith("ue "):
+        return True
+    return any(key in n for key in CONTINENTAL_KEYS)
 
 
-def is_caution_cup(country: str, name: str) -> bool:
-    c, n = norm(country), norm(name)
-    if ("emirates" in c or c == "uae") and "president" in n:
-        return True
-    if "saudi" in c and is_cup(name):
-        return True
-    return False
+def is_cup_or_continental(name: str) -> bool:
+    return is_cup(name) or is_continental(name)
 
 
 def is_big5(country: str, name: str) -> bool:
@@ -171,12 +180,6 @@ def priority(country: str, name: str) -> int:
         return 0
     if is_focus_league(country, name):
         return 1
-    if is_serious_cup(name):
-        return 2
-    if is_caution_cup(country, name):
-        return 5
-    if is_cup(name):
-        return 4
     return 3
 
 
@@ -721,10 +724,11 @@ def build_candidates(api: ApiFootball | None, fd: FootballData | None, day: str)
         card = hkjc_card()
     except (ApiError, requests.RequestException) as exc:
         notes.append(f"马会赛程失败：{exc}")
-        return [], notes, [], []
+        return [], notes, []
     now = datetime.now(TZ)
     playing = []
     started = 0
+    dropped_cup = 0
     for item in card:
         if not item.get("kickoff"):
             continue
@@ -736,12 +740,17 @@ def build_candidates(api: ApiFootball | None, fd: FootballData | None, day: str)
             continue
         if is_women_or_youth(item["tournament_en"]) or is_friendly(item["tournament_en"]):
             continue
+        if is_cup_or_continental(item["tournament_en"]):
+            dropped_cup += 1
+            continue
         playing.append((when, item))
     if started:
         notes.append(f"这个时间窗里另有 {started} 场已开赛，没有研究。")
+    if dropped_cup:
+        notes.append(f"按你的要求跳过 {dropped_cup} 场杯赛与洲际赛事，只分析联赛。")
     if not playing:
         notes.append("这个时间窗里马会没有未开赛的场次。")
-        return [], notes, [], []
+        return [], notes, []
 
     disk = load_disk(day)
     leagues: dict[str, dict] = {}
@@ -800,8 +809,6 @@ def build_candidates(api: ApiFootball | None, fd: FootballData | None, day: str)
                 "hkjc_no": item["no"],
                 "priority": priority(league["country"], league["name"]) if league["mapped"] else 3,
                 "style": style_hint(league["country"], league["name"]) if league["mapped"] else "",
-                "caution": False,
-                "serious_cup": False,
                 "home_rank": rank_text(home_info),
                 "away_rank": rank_text(away_info),
                 "hkjc": {
@@ -826,7 +833,7 @@ def build_candidates(api: ApiFootball | None, fd: FootballData | None, day: str)
                 board.append(row)
     candidates.sort(key=lambda match: (match["priority"], match["sort"]))
     board.sort(key=lambda match: match["sort"])
-    return candidates, notes, [], board
+    return candidates, notes, board
 
 
 
@@ -1556,7 +1563,7 @@ def accept_pick(pick: dict) -> bool:
     return True
 
 
-def render(day, candidates, deep, result, notes, cups, analyzed, board) -> str:
+def render(day, candidates, deep, result, notes, analyzed, board) -> str:
     start, end = slate_window(day)
     lines = [f"{PUSH_KEYWORD}早筛 {day}｜{start:%m-%d %H:%M} 至 {end:%m-%d %H:%M}", ""]
     picks = []
@@ -1615,15 +1622,6 @@ def render(day, candidates, deep, result, notes, cups, analyzed, board) -> str:
             lines.append(
                 f"- {match['kickoff']} {match['league']} {match_title(match)}｜{match['why']}｜{match.get('line_text')}"
             )
-
-    if cups:
-        lines.append("")
-        lines.append("【杯赛】")
-        for match in cups[:15]:
-            flag = "谨慎，青年军风险" if match["caution"] else match["why"]
-            lines.append(f"- {match['kickoff']} {match['league']} {match_title(match)}｜{flag}")
-        if len(cups) > 15:
-            lines.append(f"- 另有 {len(cups) - 15} 场杯赛未展开")
 
     if notes:
         lines.append("")
@@ -1796,8 +1794,8 @@ def main() -> None:
     day = args.date or datetime.now(TZ).strftime("%Y-%m-%d")
     api = ApiFootball(APIFOOTBALL_KEY) if APIFOOTBALL_KEY else None
     fd = FootballData(FOOTBALL_DATA_KEY) if FOOTBALL_DATA_KEY else None
-    candidates, notes, cups, board = build_candidates(api, fd, day)
-    deep = [match for match in candidates if not match["caution"]][:MAX_DEEP]
+    candidates, notes, board = build_candidates(api, fd, day)
+    deep = candidates[:MAX_DEEP]
     result = None
     analyzed = False
     if deep:
@@ -1806,7 +1804,7 @@ def main() -> None:
         analyzed = True
         notes.append("方向按近6场统计判定。让球、大细、角球用马会盘口。穿盘只计让球方全赢。")
 
-    text = render(day, candidates, deep, result, notes, cups, analyzed, board)
+    text = render(day, candidates, deep, result, notes, analyzed, board)
     push(text, args.dry_run)
 
 
