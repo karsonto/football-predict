@@ -14,6 +14,7 @@ import time
 import traceback
 import unicodedata
 from email.message import EmailMessage
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -64,6 +65,7 @@ PUSH_KEYWORD = os.environ.get("PUSH_KEYWORD", "足球")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 MAX_DEEP = int(os.environ.get("MAX_DEEP", "8"))
 MAX_STANDINGS = int(os.environ.get("MAX_STANDINGS", "30"))
+SEASON_WORKERS = int(os.environ.get("SEASON_WORKERS", "8"))
 
 
 class ApiError(RuntimeError):
@@ -932,6 +934,27 @@ def espn_get(url: str, params: dict | None = None) -> dict:
     return resp.json()
 
 
+def fetch_many(func, items, workers: int = SEASON_WORKERS) -> list:
+    """并发取回，结果顺序与输入一致，单条失败返回 None。
+
+    整个赛季几十场，逐场串行要等好几分钟，这里并发跑。
+    """
+    items = list(items)
+    if not items:
+        return []
+
+    def guarded(item):
+        try:
+            return func(item)
+        except Exception:
+            return None
+
+    if len(items) == 1:
+        return [guarded(items[0])]
+    with ThreadPoolExecutor(max_workers=min(workers, len(items))) as pool:
+        return list(pool.map(guarded, items))
+
+
 def cached_json(name: str, loader, max_age_hours: float | None = None):
     path = ROOT / ".cache" / name
     if path.exists():
@@ -992,11 +1015,17 @@ def settle_asian(margin: int, line: float) -> str:
     return plain(line)
 
 
-def recent_lines_for_team(slug: str, team: dict, before: datetime) -> list[dict]:
+def season_games_for_team(slug: str, team: dict, before: datetime) -> list[dict]:
+    """本赛季该队全部已完赛的联赛场次。
+
+    ESPN 的球队赛程接口按联赛抓取，返回的就是这个联赛本赛季的场次，
+    不会混进杯赛，所以这里不需要再筛赛事类型。
+    """
     team_id = str(team["id"])
 
     def load_schedule():
         body = espn_get(f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/teams/{team_id}/schedule")
+        season_year = (body.get("requestedSeason") or body.get("season") or {}).get("year")
         rows = []
         for event in body.get("events") or []:
             competition = (event.get("competitions") or [{}])[0]
@@ -1009,6 +1038,7 @@ def recent_lines_for_team(slug: str, team: dict, before: datetime) -> list[dict]
                 "id": event.get("id"),
                 "date": event.get("date"),
                 "name": event.get("name") or "",
+                "season": (event.get("season") or {}).get("year") or season_year,
                 "competitors": [
                     {
                         "id": item.get("team", {}).get("id") or item.get("id"),
@@ -1019,26 +1049,37 @@ def recent_lines_for_team(slug: str, team: dict, before: datetime) -> list[dict]
                     for item in competition.get("competitors") or []
                 ],
             })
-        return rows
+        return {"season_year": season_year, "events": rows}
 
     run_day = datetime.now(TZ).strftime("%Y-%m-%d")
-    schedule = cached_json(
-        f"espn-schedule-{slug}-{team_id}-{run_day}.json",
+    cached = cached_json(
+        f"espn-season-{slug}-{team_id}-{run_day}.json",
         load_schedule,
         max_age_hours=12,
     )
+    season_year = cached.get("season_year")
     played = []
-    for event in schedule:
-        if not event.get("date"):
+    seen = set()
+    for event in cached.get("events") or []:
+        if not event.get("date") or event.get("id") in seen:
+            continue
+        # 只认本赛季，避免跨赛季的旧数据混进来。
+        if season_year is not None and event.get("season") not in (None, season_year):
             continue
         when = kickoff_local(event["date"])
         if when >= before:
             continue
+        seen.add(event.get("id"))
         played.append(event)
     played.sort(key=lambda item: item["date"], reverse=True)
+    if not played:
+        return []
+
+    # 整个赛季几十场，逐场串行太久，并发取。事件 id 各不相同，不会写同一个缓存文件。
+    facts_list = fetch_many(lambda event: match_facts(slug, event), played)
+
     games = []
-    for event in played[:6]:
-        facts = match_facts(slug, event)
+    for event, facts in zip(played, facts_list):
         if facts is None:
             continue
         own = next((item for item in facts["sides"] if str(item["id"]) == team_id), None)
@@ -1222,11 +1263,11 @@ def team_report(slug: str, label: str, name: str, before: datetime) -> dict:
     if team is None:
         return {"name": name, "label": label, "games": [], "lines": [], "summary": "", "missing": f"{label}{name}：公开赛程没有对上球队"}
     try:
-        games = recent_lines_for_team(slug, team, before)
+        games = season_games_for_team(slug, team, before)
     except requests.RequestException as exc:
         return {"name": name, "label": label, "games": [], "lines": [], "summary": "", "missing": f"{label}{name}：近况读取失败 {exc}"}
     if not games:
-        return {"name": name, "label": label, "games": [], "lines": [], "summary": "", "missing": f"{label}{name}：没有读到近6场"}
+        return {"name": name, "label": label, "games": [], "lines": [], "summary": "", "missing": f"{label}{name}：本赛季没有已完赛的联赛场次"}
     return {
         "name": name,
         "label": label,
@@ -1802,7 +1843,7 @@ def main() -> None:
         gather_context(deep)
         result = analyze(deep)
         analyzed = True
-        notes.append("方向按近6场统计判定。让球、大细、角球用马会盘口。穿盘只计让球方全赢。")
+        notes.append("方向按本赛季全部已完赛联赛场次统计。让球、大细、角球用马会盘口。穿盘只计让球方全赢。")
 
     text = render(day, candidates, deep, result, notes, analyzed, board)
     push(text, args.dry_run)
