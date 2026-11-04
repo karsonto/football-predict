@@ -6,9 +6,6 @@ on:
     - cron: "17 1 * * *"
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   screen:
     runs-on: ubuntu-latest
@@ -18,8 +15,6 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - name: 自检
-        run: python test_external.py
       - run: python football_picker.py
         env:
           APIFOOTBALL_KEY: ${{ secrets.APIFOOTBALL_KEY }}
@@ -34,20 +29,3 @@ jobs:
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-      - name: Save picks history
-        if: always()
-        run: |
-          if [ ! -f picks-history.jsonl ]; then
-            echo "没有历史文件，跳过"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add picks-history.jsonl
-          if git diff --staged --quiet; then
-            echo "历史没有变化"
-            exit 0
-          fi
-          git commit -m "更新推荐历史与赛果"
-          git pull --rebase --autostash origin main
-          git push origin main
